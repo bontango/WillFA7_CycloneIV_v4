@@ -26,3 +26,11 @@ output_files/*.sta.rpt
 output_files/*.jdi
 output_files/*.sld
 output_files/greybox_tmp/
+
+# Quartus greybox temporary files (auto-generated during synthesis)
+greybox_tmp/
+
+# Not needed in repository
+output_files/output_files/
+archive/
+ROM/
