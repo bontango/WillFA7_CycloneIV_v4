@@ -21,8 +21,7 @@
 -- version 3.12 	 -- converted Cyclone IV v4.x board ( EP4CE6E22C8N ) 
 -- v3.13 with eeprom v094 which has reduced clock to 100KHz (old 1MHz)
 -- v3.14 solenoid 17 with peak filter as we have 9uS peaks each 2mS on sp_solenoid_mpu(1);
--- v3.15 Quartus 22.1
--- v3.16 claude debug session
+-- v3.15 Quartus 22.1, claude debug session: timing corrected, mem_clk confirmed, BT28 (SYS3 settings) corrected
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -424,12 +423,13 @@ reset_h <= (not reset_l);
 ----------------------
 -- sys3..4: direct connection
 -- sys6..7: use IRQ with OR
-pia1_ca1 <= advance when is_sys3 = '1'
-            else not ( not advance or not cpu_irq);
-pia1_cb1 <= up_down when is_sys3 = '1'
-            else not ( not up_down or not cpu_irq);
--- NMI
---diag <= not Diag_SW;
+--pia1_ca1 <= advance when is_sys3 = '1'
+--            else not ( not advance or not cpu_irq);
+--pia1_cb1 <= up_down when is_sys3 = '1'
+--            else not ( not up_down or not cpu_irq);
+
+pia1_ca1 <= not ( not advance or not cpu_irq);
+pia1_cb1 <= not ( not up_down or not cpu_irq);				
 
 --NMI
 DIAGSTABLE: entity work.Cross_Slow_To_Fast_Clock
@@ -968,14 +968,15 @@ port map (
 
        R_out => R_out, -- receiver outputs 
 
-       B_E  => not enter_stable,
-       R_E  => not pia1_ca2
+       B_E  => not enter_stable, --active high (on WillFA7 signal is '0' wenn pushed -> switch with internal pullup)
+       R_E  => not pia1_ca2  -- active low, accent inverter in Williams SYS3 schematic
     );
-
+	 
 -- BT28 IC Bus Driver Receiver
---pia1_pa_i <= W_PA_DIP & x"F" when Enter_SW = '0' else x"FF"; -- enter SW activates input
+pia1_pa_i(3 downto 0) <= "1111";
+--pia1_pa_i(7 downto 4) <= W_PA_DIP when Enter_stable = '0' else x"F"; -- enter SW activates input
 --Diag_LED <= not pia1_pa_o(5) when opt_nvram_init_n = '1' else eeprom_wr_in_progress; -- to show when eeprom has saved
-Diag_LED <= not R_out(0) when opt_nvram_init_n = '1' else eeprom_wr_in_progress; -- to show when eeprom has saved
+Diag_LED <= not R_out(0); -- when opt_nvram_init_n = '1' else eeprom_wr_in_progress; -- to show when eeprom has saved
 
 ------------------
 -- special solenoids

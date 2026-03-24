@@ -74,7 +74,7 @@ BEGIN
 		clock_enable_output_a => "BYPASS",
 		clock_enable_output_b => "BYPASS",
 		indata_reg_b => "CLOCK1",
-		init_file => "./ROM/cmos_256_0Fh.hex",
+		init_file => "cmos_256_0Fh.hex",
 		intended_device_family => "Cyclone IV E",
 		lpm_type => "altsyncram",
 		numwords_a => 256,
@@ -85,8 +85,8 @@ BEGIN
 		outdata_reg_a => "UNREGISTERED",
 		outdata_reg_b => "UNREGISTERED",
 		power_up_uninitialized => "FALSE",
-		read_during_write_mode_port_a => "NEW_DATA_NO_NBE_READ",
-		read_during_write_mode_port_b => "NEW_DATA_NO_NBE_READ",
+		read_during_write_mode_port_a => "NEW_DATA_WITH_NBE_READ",
+		read_during_write_mode_port_b => "NEW_DATA_WITH_NBE_READ",
 		widthad_a => 8,
 		widthad_b => 8,
 		width_a => 8,
@@ -147,14 +147,14 @@ END SYN;
 -- Retrieval info: PRIVATE: MAXIMUM_DEPTH NUMERIC "0"
 -- Retrieval info: PRIVATE: MEMSIZE NUMERIC "2048"
 -- Retrieval info: PRIVATE: MEM_IN_BITS NUMERIC "0"
--- Retrieval info: PRIVATE: MIFfilename STRING "./ROM/cmos_256_0Fh.hex"
+-- Retrieval info: PRIVATE: MIFfilename STRING "cmos_256_0Fh.hex"
 -- Retrieval info: PRIVATE: OPERATION_MODE NUMERIC "3"
 -- Retrieval info: PRIVATE: OUTDATA_ACLR_B NUMERIC "0"
 -- Retrieval info: PRIVATE: OUTDATA_REG_B NUMERIC "0"
 -- Retrieval info: PRIVATE: RAM_BLOCK_TYPE NUMERIC "0"
 -- Retrieval info: PRIVATE: READ_DURING_WRITE_MODE_MIXED_PORTS NUMERIC "2"
--- Retrieval info: PRIVATE: READ_DURING_WRITE_MODE_PORT_A NUMERIC "3"
--- Retrieval info: PRIVATE: READ_DURING_WRITE_MODE_PORT_B NUMERIC "3"
+-- Retrieval info: PRIVATE: READ_DURING_WRITE_MODE_PORT_A NUMERIC "4"
+-- Retrieval info: PRIVATE: READ_DURING_WRITE_MODE_PORT_B NUMERIC "4"
 -- Retrieval info: PRIVATE: REGdata NUMERIC "1"
 -- Retrieval info: PRIVATE: REGq NUMERIC "0"
 -- Retrieval info: PRIVATE: REGrdaddress NUMERIC "0"
@@ -181,7 +181,7 @@ END SYN;
 -- Retrieval info: CONSTANT: CLOCK_ENABLE_OUTPUT_A STRING "BYPASS"
 -- Retrieval info: CONSTANT: CLOCK_ENABLE_OUTPUT_B STRING "BYPASS"
 -- Retrieval info: CONSTANT: INDATA_REG_B STRING "CLOCK1"
--- Retrieval info: CONSTANT: INIT_FILE STRING "./ROM/cmos_256_0Fh.hex"
+-- Retrieval info: CONSTANT: INIT_FILE STRING "cmos_256_0Fh.hex"
 -- Retrieval info: CONSTANT: INTENDED_DEVICE_FAMILY STRING "Cyclone IV E"
 -- Retrieval info: CONSTANT: LPM_TYPE STRING "altsyncram"
 -- Retrieval info: CONSTANT: NUMWORDS_A NUMERIC "256"
@@ -192,8 +192,8 @@ END SYN;
 -- Retrieval info: CONSTANT: OUTDATA_REG_A STRING "UNREGISTERED"
 -- Retrieval info: CONSTANT: OUTDATA_REG_B STRING "UNREGISTERED"
 -- Retrieval info: CONSTANT: POWER_UP_UNINITIALIZED STRING "FALSE"
--- Retrieval info: CONSTANT: READ_DURING_WRITE_MODE_PORT_A STRING "NEW_DATA_NO_NBE_READ"
--- Retrieval info: CONSTANT: READ_DURING_WRITE_MODE_PORT_B STRING "NEW_DATA_NO_NBE_READ"
+-- Retrieval info: CONSTANT: READ_DURING_WRITE_MODE_PORT_A STRING "NEW_DATA_WITH_NBE_READ"
+-- Retrieval info: CONSTANT: READ_DURING_WRITE_MODE_PORT_B STRING "NEW_DATA_WITH_NBE_READ"
 -- Retrieval info: CONSTANT: WIDTHAD_A NUMERIC "8"
 -- Retrieval info: CONSTANT: WIDTHAD_B NUMERIC "8"
 -- Retrieval info: CONSTANT: WIDTH_A NUMERIC "8"
