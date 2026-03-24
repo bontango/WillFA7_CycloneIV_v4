@@ -1,0 +1,28 @@
+# Quartus build artifacts
+db/
+incremental_db/
+simulation/
+
+# Backup files
+*.bak
+*\ -\ Kopie.*
+
+# Quartus workspace (user-specific)
+*.qws
+
+# Claude Code internal
+.claude/
+
+# Output files - keep .sof and .pof but exclude reports
+output_files/*.rpt
+output_files/*.smsg
+output_files/*.summary
+output_files/*.asm.rpt
+output_files/*.eda.rpt
+output_files/*.fit.rpt
+output_files/*.flow.rpt
+output_files/*.map.rpt
+output_files/*.sta.rpt
+output_files/*.jdi
+output_files/*.sld
+output_files/greybox_tmp/
