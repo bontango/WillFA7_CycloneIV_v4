@@ -151,28 +151,28 @@ set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_
 set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_symbol
 set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_signal_integrity
 set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_boundary_scan
-set_global_assignment -name VHDL_FILE AM8T28.vhd
-set_global_assignment -name VHDL_FILE peak_filter.vhd
+set_global_assignment -name QIP_FILE lib_cyclone_IV/R5101.qip
+set_global_assignment -name VHDL_FILE lib_common/AM8T28.vhd
+set_global_assignment -name VHDL_FILE lib_common/peak_filter.vhd
 set_global_assignment -name SDC_FILE WillFA7.sdc
-set_global_assignment -name VHDL_FILE one_pulse_only.vhd
-set_global_assignment -name VHDL_FILE count_to_zero.vhd
-set_global_assignment -name VHDL_FILE irq_generator.vhd
-set_global_assignment -name QIP_FILE williams_pll.qip
-set_global_assignment -name VHDL_FILE spec_sol_trigger.vhd
-set_global_assignment -name VHDL_FILE detect_sw.vhd
-set_global_assignment -name VHDL_FILE byte_to_decimal.vhd
-set_global_assignment -name VHDL_FILE boot_message.vhd
-set_global_assignment -name VHDL_FILE EEprom.vhd
-set_global_assignment -name VHDL_FILE SPI_Master.vhd
-set_global_assignment -name VHDL_FILE SD_Card.vhd
-set_global_assignment -name VHDL_FILE read_the_dips.vhd
-set_global_assignment -name VHDL_FILE slow_to_fast_clock.vhd
-set_global_assignment -name VHDL_FILE flipflops.vhd
-set_global_assignment -name QIP_FILE R5101.qip
-set_global_assignment -name VHDL_FILE pia6821.vhd
-set_global_assignment -name VHDL_FILE cpu68.vhd
-set_global_assignment -name VHDL_FILE cpu_clk_gen.vhd
+set_global_assignment -name VHDL_FILE lib_common/one_pulse_only.vhd
+set_global_assignment -name VHDL_FILE lib_common/count_to_zero.vhd
+set_global_assignment -name VHDL_FILE lib_common/irq_generator.vhd
+set_global_assignment -name QIP_FILE lib_cyclone_IV/williams_pll.qip
+set_global_assignment -name VHDL_FILE lib_common/spec_sol_trigger.vhd
+set_global_assignment -name VHDL_FILE lib_common/detect_sw.vhd
+set_global_assignment -name VHDL_FILE lib_common/byte_to_decimal.vhd
+set_global_assignment -name VHDL_FILE lib_common/boot_message.vhd
+set_global_assignment -name VHDL_FILE lib_common/EEprom.vhd
+set_global_assignment -name VHDL_FILE lib_common/SPI_Master.vhd
+set_global_assignment -name VHDL_FILE lib_common/SD_Card.vhd
+set_global_assignment -name VHDL_FILE lib_common/read_the_dips.vhd
+set_global_assignment -name VHDL_FILE lib_common/slow_to_fast_clock.vhd
+set_global_assignment -name VHDL_FILE lib_common/flipflops.vhd
+set_global_assignment -name VHDL_FILE lib_common/pia6821.vhd
+set_global_assignment -name VHDL_FILE lib_common/cpu68.vhd
+set_global_assignment -name VHDL_FILE lib_common/cpu_clk_gen.vhd
 set_global_assignment -name VHDL_FILE WillFA7.vhd
-set_global_assignment -name QIP_FILE ram.qip
-set_global_assignment -name QIP_FILE rom_2K.qip
+set_global_assignment -name QIP_FILE lib_cyclone_IV/ram.qip
+set_global_assignment -name QIP_FILE lib_cyclone_IV/rom_2K.qip
 set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top

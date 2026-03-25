@@ -1,5 +1,0 @@
-PLL_Name	williams_pll:PLL|altpll:altpll_component|williams_pll_altpll:auto_generated|pll1
-PLLJITTER	NA
-PLLSPEmax	84
-PLLSPEmin	-53
-
