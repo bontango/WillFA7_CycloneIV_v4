@@ -355,8 +355,11 @@ SPI_CLK <= SDcard_CLK when boot_phase(2) = '0' else EEprom_CLK;
 -- SD card stuff
 ----------------------
 SD_CARD: entity work.SD_Card
+generic map(
+	Read_Bytes => 12288  -- 12 KByte = 24 sectors per game (6 ROMs x 2K)
+)
 port map(
-	i_clk		=> clk_50,	
+	i_clk		=> clk_50,
 	-- Control/Data Signals,
    i_Rst_L  => boot_phase(1), -- first dip read finished
 	-- PMOD SPI Interface

@@ -12,6 +12,10 @@
 -- v05 reset_l & 10Kbyte read
 -- v06 wait 0.5 ec before start cpu
 -- v07 12Kbyte read
+-- v08 robustness Stage A: watchdogs on all wait states, distinct error blink
+--     codes (1=SPI hang, 2=CMD0 fail, 3=CMD8 unsupported, 4=ACMD41 timeout,
+--     5=data token timeout), ACMD41 retry cap reduced 5000->100
+-- v09 ROM read size made configurable via generic Read_Bytes (default 12288)
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -20,6 +24,13 @@ use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
 	entity SD_Card is
+		generic (
+			-- Number of bytes to read from SD card (must be a multiple of 512).
+			-- Default 12288 = 12 KByte = 24 sectors, matches the legacy behaviour.
+			-- The address bus address_sd_card is 14 bit wide, so the practical
+			-- upper limit without further changes is 16384 bytes.
+			Read_Bytes : integer := 12288
+		);
 		port(
 		i_Clk		: IN STD_LOGIC  := '1';
 		-- Control/Data Signals,
@@ -77,11 +88,22 @@ use IEEE.numeric_std.all;
 		signal do_not_enable_SS : std_LOGIC;	
 		signal sector : unsigned (15 downto 0);	
 		
-		signal byte_count : integer range 0 to 520; 		
-		
-		signal attempts : integer range 0 to 5000; 
+		signal byte_count : integer range 0 to 520;
+
+		signal attempts : integer range 0 to 5000;
 		signal counter  : integer range 0 to 100000000;   -- delay, for 10ms use 500.000
-	begin		
+
+		-- Stufe-A robustness: watchdog + distinct error codes
+		-- Error blink codes (visible on SDcard_error LED):
+		--   1 = SPI transfer hang  (TX_Done never asserted within 1 s)
+		--   2 = CMD0 reset failed  (8 attempts exhausted)
+		--   3 = CMD8 unsupported   (likely old SDv1 card; not implemented)
+		--   4 = ACMD41 init timeout (card never left idle)
+		--   5 = Sector data token timeout (no 0xFE within 500 ms)
+		signal wd_count        : integer range 0 to 100000000; -- general watchdog (~2 s headroom @ 50 MHz)
+		signal err_code        : integer range 0 to 15;
+		signal blink_remaining : integer range 0 to 15;
+	begin
 		
 		-- signals for the two SPI Master
 	o_SPI_MOSI <=	
@@ -167,7 +189,10 @@ SD_CARD_READ: entity work.SPI_Master --read i byte by byte (slooow)
 				SDcard_error <= '1'; -- active low
 				counter <= 0;
 				attempts <= 0;
-				state_A <= Startdelay;    
+				wd_count <= 0;
+				err_code <= 0;
+				blink_remaining <= 0;
+				state_A <= Startdelay;
 			else			
 				case state_A is
 				-- STATE MASCHINE ----------------
@@ -189,34 +214,42 @@ SD_CARD_READ: entity work.SPI_Master --read i byte by byte (slooow)
 						when 4 => TX_Data_A <= x"FF" & CMD55 & x"FFFFFFFFFFFFFF";						
 						when 5 => TX_Data_A <= x"FF" & ACMD41 & x"FFFFFFFFFFFFFF";		
 						when 6 => TX_Data_A <= x"FF" & CMD58 & x"FFFFFFFFFFFFFF";		
-						when 7 => TX_Data_A <= x"FF" & CMD18 & x"FFFFFFFFFFFFFF";	
+						when 7 => TX_Data_A <= x"FF" & CMD18 & x"FFFFFFFFFFFFFF";
 									 do_not_disable_SS <= '1';
 									 -- special: calculate sector on WillFA SD
-									 -- where to read rom dependign on dip switch
+									 -- where to read rom depending on dip switch
 									 -- first rom starts at sector 660
-									 -- we have 12KByte of data
-									 -- which is 24 sectors 512Byte each
-									 TX_Data_A(79 downto 64)  <= std_logic_vector (unsigned(selection) *24 + 660);											 									 
+									 -- per game: Read_Bytes/512 sectors (default 12 KB = 24 sectors)
+									 TX_Data_A(79 downto 64)  <= std_logic_vector (unsigned(selection) * (Read_Bytes/512) + 660);
 						when 8 => TX_Data_A <= x"FF" & CMD12 & x"FFFFFFFFFFFFFF";	
 									 do_not_disable_SS <= '0';	
 						when others => TX_Data_A <= x"FF" & x"FFFFFFFFFFFF" & x"FFFFFFFFFFFFFF"; --  read
 					end case;
-					TX_Start_A <= '1'; -- set flag for sending byte		
-					state_A <= wait_for_read;					
-										
-				when wait_for_read =>					
+					TX_Start_A <= '1'; -- set flag for sending byte
+					wd_count <= 0;     -- watchdog: SPI transfer must complete within ~1 s
+					state_A <= wait_for_read;
+
+				when wait_for_read =>
 						if (TX_Done_A = '1') then -- Master sets TX_Done when TX is done ;-)
-							TX_Start_A <= '0'; -- reset flag 		
+							TX_Start_A <= '0'; -- reset flag
 								-- we assume R1 Response is at fix postion ( 1 Byte nCR, then R1)
 								-- some cards have it one position later so lets try this also
-								R1_response <= RX_Data_A( 47 downto 40);								
-								R1_response_2 <= RX_Data_A( 39 downto 32);	--sometimes R1 response comes late							
-								Echo_response <= RX_Data_A( 15 downto 8);								
-							state_A <= continue;							
+								R1_response <= RX_Data_A( 47 downto 40);
+								R1_response_2 <= RX_Data_A( 39 downto 32);	--sometimes R1 response comes late
+								Echo_response <= RX_Data_A( 15 downto 8);
+							state_A <= continue;
+						elsif wd_count >= 50000000 then -- 1 s @ 50 MHz: SPI never finished
+							TX_Start_A <= '0';
+							err_code <= 1;
+							blink_remaining <= 1;
+							counter <= 0;
+							state_A <= error;
+						else
+							wd_count <= wd_count + 1;
 						end if;
 										
-				when continue =>		
-					if (TX_Done_A = '0') then -- Master sets back TX_Done when ready again				
+				when continue =>
+					if (TX_Done_A = '0') then -- Master sets back TX_Done when ready again
 								cmd_count <= cmd_count +1;
 								case cmd_count is
 									when 2 => --check response of CMD0
@@ -224,46 +257,60 @@ SD_CARD_READ: entity work.SPI_Master --read i byte by byte (slooow)
 											if (attempts < 8) then
 												cmd_count <= 2; --repeat
 												attempts <= attempts +1;
-												state_A <= delay_and_repeat; 
-											else											
+												state_A <= delay_and_repeat;
+											else
+												err_code <= 2; -- CMD0 reset failed
+												blink_remaining <= 2;
+												counter <= 0;
 												state_A <= error;
-											end if;	
+											end if;
 										else --success
 											attempts <= 0;
-											state_A <= send_read_request; -- next cmd to send																																						
-										end if;																		
+											state_A <= send_read_request; -- next cmd to send
+										end if;
 									when 3 => --check response of CMD8
 										if ( ( R1_response /= x"01") or (Echo_response /= x"AA")) then
+											-- Most likely: SDv1.x card answers CMD8 with illegal-command (R1 = 0x05).
+											-- We do not implement the SDv1 init path -> report cleanly instead of hanging.
+											err_code <= 3;
+											blink_remaining <= 3;
+											counter <= 0;
 											state_A <= error;
 										else
-											state_A <= send_read_request; -- next cmd to send																											
+											state_A <= send_read_request; -- next cmd to send
 										end if;
 									when 5 => -- count 5 is SD card init--repeat CMD55 & ACMD41 until card is READY
-										if (( R1_response /= x"00") and ( R1_response_2 /= x"00")) then 										
-											if (attempts < 5000) then
+										if (( R1_response /= x"00") and ( R1_response_2 /= x"00")) then
+											-- Reduced from 5000 (->500 s) to 100 (->~10 s) which is well above
+											-- the ~1 s typical SD power-up time per spec.
+											if (attempts < 100) then
 												cmd_count <= 4; --repeat go back to CMD55
 												attempts <= attempts +1;
-												state_A <= delay_and_repeat; 
+												state_A <= delay_and_repeat;
 											else
+												err_code <= 4; -- ACMD41 init timeout
+												blink_remaining <= 4;
+												counter <= 0;
 												state_A <= error;
-											end if;	
+											end if;
 										else --success
 											attempts <= 0;
-											state_A <= send_read_request; -- next cmd to send																																						
-										end if;													
+											state_A <= send_read_request; -- next cmd to send
+										end if;
 									when 7 => --last command send, we now read data
-										cmd_count <= 0;	
+										cmd_count <= 0;
 										TX_Data_R <= x"FF";
-										active_master <= "10";		
-										address_sd_card <= (others => '0');			
-										byte_count <= 0;							
+										active_master <= "10";
+										address_sd_card <= (others => '0');
+										byte_count <= 0;
+										wd_count <= 0; -- arm sector-token watchdog (~500 ms)
 										state_A <= initiate_read_sector;
 									when 8 => -- we send CMD12 to stop read sector, all done
-										wr_rom <= '0';		
-										state_A <= all_done;																
-										
+										wr_rom <= '0';
+										state_A <= all_done;
+
 									when others =>
-										state_A <= send_read_request; -- next cmd to send																											
+										state_A <= send_read_request; -- next cmd to send
 								end case;
 					end if;
 					
@@ -279,39 +326,57 @@ SD_CARD_READ: entity work.SPI_Master --read i byte by byte (slooow)
 		-- read 20 sectors -------------------
 		--------------------------------------
 		
-				when initiate_read_sector =>				
-							TX_Start_R <= '1'; -- set flag for sending byte												
-							state_A <= wait_for_begin_of_data;					
-							
+				when initiate_read_sector =>
+							TX_Start_R <= '1'; -- set flag for sending byte
+							state_A <= wait_for_begin_of_data;
+
 				when wait_for_begin_of_data =>
 							if (TX_Done_R = '1') then -- Master sets TX_Done when TX is done ;-)
-							TX_Start_R <= '0'; -- reset flag 		
+							TX_Start_R <= '0'; -- reset flag
 							state_A <= check_for_FE_flag;
+						elsif wd_count >= 25000000 then -- 500 ms: card never delivered data token
+							TX_Start_R <= '0';
+							err_code <= 5;
+							blink_remaining <= 5;
+							counter <= 0;
+							state_A <= error;
+						else
+							wd_count <= wd_count + 1;
 						end if;
-						
-				when check_for_FE_flag =>							
-						if (TX_Done_R = '0') then -- Master sets back TX_Done when ready again						
+
+				when check_for_FE_flag =>
+						if (TX_Done_R = '0') then -- Master sets back TX_Done when ready again
 						data_sd_card <= RX_Data_R;
-						   if RX_Data_R = x"FE" then							
+						   if RX_Data_R = x"FE" then
+								wd_count <= 0; -- 0xFE found: re-arm watchdog for the next sector
 								state_A <= sector_read; --flag found, next byte is data
 							else
 								state_A <= initiate_read_sector; --next byte to read and check
-							end if;							
+							end if;
 						end if;
 	
 				when sector_read =>
-							TX_Start_R <= '1'; -- set flag for sending byte		
+							TX_Start_R <= '1'; -- set flag for sending byte
 							wr_rom <= '0'; --stop writing to ram/rom
-							state_A <= wait_for_byte_read;					
-							
+							wd_count <= 0; -- per-byte watchdog
+							state_A <= wait_for_byte_read;
+
 				when wait_for_byte_read =>
-							if (TX_Done_R = '1') then -- Master sets TX_Done when TX is done ;-)							
-									TX_Start_R <= '0'; -- reset flag 	
+							if (TX_Done_R = '1') then -- Master sets TX_Done when TX is done ;-)
+									TX_Start_R <= '0'; -- reset flag
 									-- count byte
-									byte_count <= byte_count +1;		
+									byte_count <= byte_count +1;
 									--assign data
-									data_sd_card <= RX_Data_R;											
+									data_sd_card <= RX_Data_R;
 									state_A <= check_sector_byte;
+							elsif wd_count >= 5000000 then -- 100 ms per byte: SPI hang during stream
+									TX_Start_R <= '0';
+									err_code <= 1;
+									blink_remaining <= 1;
+									counter <= 0;
+									state_A <= error;
+							else
+									wd_count <= wd_count + 1;
 							end if;
 							
 				when check_sector_byte =>							
@@ -325,21 +390,20 @@ SD_CARD_READ: entity work.SPI_Master --read i byte by byte (slooow)
 								state_A <= sector_read;		-- next byte						
 							else -- sector read finished
 								byte_count <= 0;
-								state_A <= initiate_read_sector;		-- next sector					
+								wd_count <= 0;                            -- arm watchdog for next 0xFE token
+								state_A <= initiate_read_sector;		-- next sector
 							end if;																											
 						end if;
 						
-				when inc_addr_and_unset_wr =>		
-								wr_rom <= '0';	
+				when inc_addr_and_unset_wr =>
+								wr_rom <= '0';
 								-- prepare address for next
 								address_sd_card <= std_LOGIC_VECTOR(unsigned(address_sd_card) +1);
-								-- finished?																
-								--if unsigned(address_sd_card) = "1111111111111" then 	-- 8K								
-								--if unsigned(address_sd_card) = "10011111111111" then 		-- 10K								
-								if unsigned(address_sd_card) = "10111111111111" then 		-- 12K								
+								-- finished? (last written address = Read_Bytes - 1)
+								if unsigned(address_sd_card) = to_unsigned(Read_Bytes - 1, address_sd_card'length) then
 										state_A <= stop_read;		--just read last byte
 								else
-										state_A <= sector_read;		-- next byte						
+										state_A <= sector_read;		-- next byte
 								end if;
 												
 				when stop_read =>																
@@ -356,27 +420,35 @@ SD_CARD_READ: entity work.SPI_Master --read i byte by byte (slooow)
 						SDcard_error <= '1'; --active low				
 					end if;
 					
-				when error =>		-- blinkcode according to cmd								
-					counter <= counter +1;					
-					if ( counter = 50000000 ) then --1s							
-						SDcard_error <= '0'; --active low
-					end if;						
-					if ( counter = 100000000 ) then --1s							
-						SDcard_error <= '1'; --active low
-						cmd_count <= cmd_count -1;
-						counter <= 0;
-					end if;	
-					if (cmd_count = 0) then
-						state_A <= stop;
+				when error =>
+					-- Blink err_code times (LED active-low: '0' = on), then ~2 s gap, repeat forever.
+					-- Per blink: 250 ms ON, 250 ms OFF.
+					counter <= counter + 1;
+					if blink_remaining = 0 then
+						-- gap between blink groups: keep LED off ('1') for ~2 s, then re-arm.
+						SDcard_error <= '1';
+						if counter >= 100000000 then -- 2 s @ 50 MHz
+							counter <= 0;
+							blink_remaining <= err_code;
+						end if;
+					else
+						if counter < 12500000 then       -- 0..250 ms: LED on
+							SDcard_error <= '0';
+						elsif counter < 25000000 then    -- 250..500 ms: LED off
+							SDcard_error <= '1';
+						else                              -- end of one blink
+							counter <= 0;
+							blink_remaining <= blink_remaining - 1;
+						end if;
 					end if;
-														
-					
-				when stop =>						
-					if ( counter = 50000000 ) then --1s							
+
+
+				when stop =>
+					if ( counter = 50000000 ) then --1s
 						SDcard_error <= '0'; --active low
 					else
-						counter <= counter +1;						
-					end if;						
+						counter <= counter +1;
+					end if;
 
 					
 				end case;	
