@@ -35,7 +35,8 @@ entity SPI_Master is  -- SPI-Modus 0: CPOL=0, CPHA=0
            TX_Done  : out STD_LOGIC;
            clk      : in  STD_LOGIC;
 			  do_not_disable_SS : in STD_LOGIC;
-			  do_not_enable_SS : in STD_LOGIC
+			  do_not_enable_SS : in STD_LOGIC;
+			  i_Rst_L  : in STD_LOGIC := '1'  -- synchronous, active-low; default keeps legacy instantiations compatible
          );
 end SPI_Master;
 
@@ -55,10 +56,19 @@ architecture Behavioral of SPI_Master is
 
 begin
   ------ Verwaltung --------
-  process begin 
+  process begin
      wait until rising_edge(CLK);
+     if i_Rst_L = '0' then
+        spitxstate <= spi_stx;
+        SS         <= '1';
+        TX_Done    <= '0';
+        spiclk     <= '0';
+        bitcounter <= Laenge;
+        delay      <= clock_delay;
+        spiclklast <= '0';
+     else
      if(delay>0) then delay <= delay-1;
-     else             delay <= clock_delay;  
+     else             delay <= clock_delay;
      end if;
      spiclklast <= spiclk;
      case spitxstate is
@@ -98,7 +108,8 @@ begin
                spitxstate <= spi_stx;
              end if;
      end case;
-  end process;   
+     end if; -- i_Rst_L
+  end process;
   
   ---- Empfangsschieberegister -----
   process begin 

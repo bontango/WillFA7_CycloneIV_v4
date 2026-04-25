@@ -22,6 +22,7 @@
 -- v3.13 with eeprom v094 which has reduced clock to 100KHz (old 1MHz)
 -- v3.14 solenoid 17 with peak filter as we have 9uS peaks each 2mS on sp_solenoid_mpu(1);
 -- v3.15 Quartus 22.1, claude debug session: timing corrected, mem_clk confirmed, BT28 (SYS3 settings) corrected
+-- v3.16 eeprom write robustnes
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -84,10 +85,10 @@ entity WillFA7 is
 		DIP_Str_1: out std_logic;
 		DIP_Str_2: out std_logic;
 		DIP_Str_3: out std_logic;
-		DIP_Str_4: out std_logic;
+		DIP_Str_4: out std_logic
 						
 		--debug cyclone IV only
-		debug: out std_logic
+		--debug: out std_logic
 		
 		);
 end;
@@ -267,14 +268,14 @@ signal is_sys3 : std_logic; -- '1' for System3/4 (game_select 0-8)
 -- SW version
 constant SW_MAIN : std_logic_vector(3 downto 0) := x"3";
 constant SW_SUB1 : std_logic_vector(3 downto 0) := x"1";
-constant SW_SUB2 : std_logic_vector(3 downto 0) := x"5";
+constant SW_SUB2 : std_logic_vector(3 downto 0) := x"6";
 
 begin
 
 --debug port pin64 on board -> pin_84 in config for cyclone IV
 -- nmi address ( vector fff8 & fff9 )
 --debug <= '1' when cpu_addr = x"7053" and rom4_cs = '1' else '0';
-debug <= '1' when cpu_addr = x"FFFC" else '0'; --NMI
+--debug <= '1' when cpu_addr = x"FFFC" else '0'; --NMI
 
 LED_status <= not boot_phase(0); -- for display blanking
 LED_sd_Error <=  SDcard_error;

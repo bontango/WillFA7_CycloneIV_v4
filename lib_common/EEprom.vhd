@@ -103,8 +103,14 @@ use IEEE.numeric_std.all;
 		signal WIP_bit :  std_LOGIC; -- write in progress
 		-- we react to edges of triggers, so we need to remember
 		signal old_w_trigger : std_LOGIC_VECTOR ( 4 downto 0);
-		
+		-- 2-FF synchronizer for w_trigger (incoming from other clock domains / async sources)
+		signal w_trigger_sync1 : std_LOGIC_VECTOR ( 4 downto 0);
+		signal w_trigger_sync2 : std_LOGIC_VECTOR ( 4 downto 0);
+
 		signal c_count : integer range 0 to 500000000;
+		-- WIP-poll timeout: bail out if EEPROM never reports write-complete.
+		-- One RDSR transfer at 100 kHz SPI takes ~160 us; 50 ms tWC budget => ~312 polls.
+		signal wip_poll_count : integer range 0 to 1023;
 		
 	begin		
 	
@@ -147,7 +153,8 @@ EEPROM_WRITE: entity work.SPI_Master
            TX_Done  => TX_Done_W,
            clk      => i_Clk,
 			  do_not_disable_SS => '0',
-			  do_not_enable_SS => '0'
+			  do_not_enable_SS => '0',
+			  i_Rst_L  => i_Rst_L
       );
 		
 EEPROM_READ: entity work.SPI_Master
@@ -165,7 +172,8 @@ EEPROM_READ: entity work.SPI_Master
            TX_Done  => TX_Done_R,
            clk      => i_Clk,
 			  do_not_disable_SS => '0',
-			  do_not_enable_SS => '0'
+			  do_not_enable_SS => '0',
+			  i_Rst_L  => i_Rst_L
       );
 
 EEPROM_STAT: entity work.SPI_Master
@@ -183,7 +191,8 @@ EEPROM_STAT: entity work.SPI_Master
            TX_Done  => TX_Done_Stat,
            clk      => i_Clk,
 			  do_not_disable_SS => '0',
-			  do_not_enable_SS => '0'
+			  do_not_enable_SS => '0',
+			  i_Rst_L  => i_Rst_L
       );
 
 EEPROM_CMD: entity work.SPI_Master
@@ -201,23 +210,30 @@ EEPROM_CMD: entity work.SPI_Master
            TX_Done  => TX_Done_Cmd,
            clk      => i_Clk,
 			  do_not_disable_SS => '0',
-			  do_not_enable_SS => '0'
+			  do_not_enable_SS => '0',
+			  i_Rst_L  => i_Rst_L
       );
 		
-EEPROM: process (i_Clk, w_trigger, i_Rst_L)
+EEPROM: process (i_Clk, i_Rst_L)
 			begin
-			if i_Rst_L = '0' then --Reset condidition (reset_l)    
-				TX_Start_R <= '0';				
-				TX_Start_W <= '0';				
-				TX_Start_Cmd <= '0';				
-				TX_Start_Stat <= '0';				
+			if i_Rst_L = '0' then --Reset condidition (reset_l)
+				TX_Start_R <= '0';
+				TX_Start_W <= '0';
+				TX_Start_Cmd <= '0';
+				TX_Start_Stat <= '0';
 				address_eeprom <= "00000000";
-				wr_ram <= '0';				
+				wr_ram <= '0';
 				c_count <= 0;
 				done <= '0';
-				state <= Check_dip;    	
+				state <= Check_dip;
 				o_wr_in_progress <= '1';
+				wip_poll_count <= 0;
+				w_trigger_sync1 <= (others => '0');
+				w_trigger_sync2 <= (others => '0');
 			elsif rising_edge(i_Clk) then
+				-- 2-FF synchronizer for w_trigger; consume w_trigger_sync2 below
+				w_trigger_sync1 <= w_trigger;
+				w_trigger_sync2 <= w_trigger_sync1;
 				case state is
 				-- STATE MASCHINE ----------------
 				when Check_dip => -- check dip switch if we need to read eeprom				
@@ -266,36 +282,36 @@ EEPROM: process (i_Clk, w_trigger, i_Rst_L)
 							end if;
 						end if;							
 
-				 when Delay => -- wait 2 seconds before react to first trigger				   
+				 when Delay => -- wait 2 seconds before react to first trigger
 					if c_count < 100000000 then
 						c_count <= c_count +1;
-					else	
-						done <= '1'; --signal that we are ready 
-						c_count <= 0;						
-						old_w_trigger <= w_trigger;
+					else
+						done <= '1'; --signal that we are ready
+						c_count <= 0;
+						old_w_trigger <= w_trigger_sync2;
 						state <= Idle;
 					end if;
-					
-				 when Idle => 			
-					o_wr_in_progress <= '1';
-					if w_trigger /= old_w_trigger then					
-							old_w_trigger <= w_trigger;
-							address_eeprom <= "00000000";									
-							state <= Delay2;				
-					end if;	
 
-				when Delay2 => -- wait 1us then check status of trigger again (glitch?)
-					if c_count < 50 then
+				 when Idle =>
+					o_wr_in_progress <= '1';
+					if w_trigger_sync2 /= old_w_trigger then
+							old_w_trigger <= w_trigger_sync2;
+							address_eeprom <= "00000000";
+							state <= Delay2;
+					end if;
+
+				when Delay2 => -- 5 ms debounce, then re-check trigger stability (glitch?)
+					if c_count < 250000 then
 						c_count <= c_count +1;
-					else	
+					else
 						c_count <= 0;
-						if w_trigger = old_w_trigger then -- trigger stable
+						if w_trigger_sync2 = old_w_trigger then -- trigger stable
 							state <= Delay3;
 						else
-							old_w_trigger <= w_trigger; -- trigger NOT stable
+							old_w_trigger <= w_trigger_sync2; -- trigger NOT stable
 							state <= Idle;
 						end if;
-					end if;															
+					end if;
 
 				when Delay3 => -- wait another second before write eeprom
 					o_wr_in_progress <= '0'; -- signal to outside that we are going to write
@@ -306,10 +322,11 @@ EEPROM: process (i_Clk, w_trigger, i_Rst_L)
 						state <= Write_enable;
 					end if;
 					
-				when Write_enable => -- enable writing								
-					TX_Data_Cmd <= "00000110"; -- write enable					
-					TX_Start_Cmd <= '1'; -- set flag for sending byte											
-					state <= wait_for_Cmd_done;					
+				when Write_enable => -- enable writing
+					TX_Data_Cmd <= "00000110"; -- write enable
+					TX_Start_Cmd <= '1'; -- set flag for sending byte
+					wip_poll_count <= 0; -- reset WIP-poll watchdog for this byte
+					state <= wait_for_Cmd_done;
 					
 				when wait_for_Cmd_done =>													
 					if (TX_Done_Cmd = '1') then				
@@ -365,14 +382,19 @@ EEPROM: process (i_Clk, w_trigger, i_Rst_L)
 							state <= check_WP_bit;					
 				   end if;
 		
-				when check_WP_bit =>													
-							if WIP_bit = '0' then 
+				when check_WP_bit =>
+							if WIP_bit = '0' then
 							   -- 0 means write is complete. lets see if we need another round
-								state <= next_write;	
+								state <= next_write;
+							elsif wip_poll_count >= 500 then
+								-- WIP stuck high (no EEPROM, MISO floating, /W asserted, BP set, ...)
+								-- abort gracefully instead of hanging the save module forever.
+								state <= Idle;
 							else
 								-- not finished yet, get status register again
-								state <= get_status_reg;	
-							end if;						
+								wip_poll_count <= wip_poll_count + 1;
+								state <= get_status_reg;
+							end if;
 				
 				when next_write =>			
 							-- increment address

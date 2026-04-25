@@ -152,7 +152,7 @@ W_PA_DIP[1]                  : 80        : input  : 3.3-V LVTTL       :         
 VCCIO5                       : 81        : power  :                   : 3.3V    : 5         :                
 GND                          : 82        : gnd    :                   :         :           :                
 W_PA_DIP[2]                  : 83        : input  : 3.3-V LVTTL       :         : 5         : Y              
-debug                        : 84        : output : 3.3-V LVTTL       :         : 5         : Y              
+RESERVED_INPUT_WITH_WEAK_PULLUP : 84        :        :                   :         : 5         :                
 RESERVED_INPUT_WITH_WEAK_PULLUP : 85        :        :                   :         : 5         :                
 W_PA_DIP[3]                  : 86        : input  : 3.3-V LVTTL       :         : 5         : Y              
 W_PA_DIP[0]                  : 87        : input  : 3.3-V LVTTL       :         : 5         : Y              
