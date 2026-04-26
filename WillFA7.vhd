@@ -201,6 +201,7 @@ signal gen_irq		:	std_logic;
 signal blanking	:	std_logic:='1';
 signal eeprom_trigger	:	std_logic:='0';
 signal eeprom_wr_in_progress	:	std_logic:='1';
+signal eeprom_error_sig		:	std_logic:='0';
 
 -- SD card
 signal address_sd_card	:  std_logic_vector(13 downto 0);
@@ -279,7 +280,9 @@ begin
 
 LED_status <= not boot_phase(0); -- for display blanking
 LED_sd_Error <=  SDcard_error;
-LED_active <= blanking;
+-- LED_active shows EEprom_error (1 Hz blink) while EEprom is actively writing/verifying,
+-- otherwise the normal display blanking signal.
+LED_active <= eeprom_error_sig when eeprom_wr_in_progress = '0' else blanking;
 
 opt_nvram_init_n <= game_option(1); -- 0 if option Dip1 is set
 
@@ -411,8 +414,9 @@ port map(
 	-- signal when finished
 		-- signal when finished
 	done	=> boot_phase(3), -- set to '1' when first read of eeprom and write to cmos is done
-	o_wr_in_progress => eeprom_wr_in_progress
-	);	
+	o_wr_in_progress => eeprom_wr_in_progress,
+	EEprom_error => eeprom_error_sig
+	);
 -----------------------------------------------
 -- phase 3: activated by eeprom after first read/write
 -- now williams rom take control
