@@ -146,7 +146,6 @@ set_location_assignment PIN_87 -to W_PA_DIP[0]
 set_location_assignment PIN_80 -to W_PA_DIP[1]
 set_location_assignment PIN_83 -to W_PA_DIP[2]
 set_location_assignment PIN_86 -to W_PA_DIP[3]
-set_location_assignment PIN_84 -to debug
 set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_timing
 set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_symbol
 set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_signal_integrity
