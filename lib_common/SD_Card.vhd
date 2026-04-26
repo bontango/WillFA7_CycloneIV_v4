@@ -16,6 +16,11 @@
 --     codes (1=SPI hang, 2=CMD0 fail, 3=CMD8 unsupported, 4=ACMD41 timeout,
 --     5=data token timeout), ACMD41 retry cap reduced 5000->100
 -- v09 ROM read size made configurable via generic Read_Bytes (default 12288)
+-- v10 Stage A reste: R1 response located via priority search across all 7
+--     response bytes (handles cards with Ncr > 2 byte latency); data-error-
+--     token (0000 xxxx, low nibble != 0) detected during sector polling
+--     instead of waiting for the FE-token watchdog. New error code 6 = data
+--     error token. R1_response_2 obsolete and removed.
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -80,9 +85,11 @@ use IEEE.numeric_std.all;
 		
 		-----		
 		signal cmd_count : integer range 0 to 16; 
-		signal R1_response : std_LOGIC_VECTOR (7 downto 0);		
-		signal R1_response_2 : std_LOGIC_VECTOR (7 downto 0);		
-		signal Echo_response : std_LOGIC_VECTOR (7 downto 0);		
+		signal R1_response : std_LOGIC_VECTOR (7 downto 0);
+		-- position of R1 within the 7 response bytes (0..6); 7 = none found.
+		-- For CMD8, valid echo is only available for R1_pos <= 2.
+		signal R1_pos : integer range 0 to 7;
+		signal Echo_response : std_LOGIC_VECTOR (7 downto 0);
 		signal active_master : std_LOGIC_VECTOR (1 downto 0) := "00";
 		signal do_not_disable_SS : std_LOGIC;		
 		signal do_not_enable_SS : std_LOGIC;	
@@ -100,6 +107,7 @@ use IEEE.numeric_std.all;
 		--   3 = CMD8 unsupported   (likely old SDv1 card; not implemented)
 		--   4 = ACMD41 init timeout (card never left idle)
 		--   5 = Sector data token timeout (no 0xFE within 500 ms)
+		--   6 = Data error token received (card aborted the sector read)
 		signal wd_count        : integer range 0 to 100000000; -- general watchdog (~2 s headroom @ 50 MHz)
 		signal err_code        : integer range 0 to 15;
 		signal blink_remaining : integer range 0 to 15;
@@ -192,6 +200,9 @@ SD_CARD_READ: entity work.SPI_Master --read i byte by byte (slooow)
 				wd_count <= 0;
 				err_code <= 0;
 				blink_remaining <= 0;
+				R1_pos <= 7;
+				R1_response <= x"FF";
+				Echo_response <= x"00";
 				state_A <= Startdelay;
 			else			
 				case state_A is
@@ -232,11 +243,44 @@ SD_CARD_READ: entity work.SPI_Master --read i byte by byte (slooow)
 				when wait_for_read =>
 						if (TX_Done_A = '1') then -- Master sets TX_Done when TX is done ;-)
 							TX_Start_A <= '0'; -- reset flag
-								-- we assume R1 Response is at fix postion ( 1 Byte nCR, then R1)
-								-- some cards have it one position later so lets try this also
-								R1_response <= RX_Data_A( 47 downto 40);
-								R1_response_2 <= RX_Data_A( 39 downto 32);	--sometimes R1 response comes late
-								Echo_response <= RX_Data_A( 15 downto 8);
+								-- R1 search: SD spec allows Ncr = 0..8 byte latency between command
+								-- and response. 7 response bytes are captured (after the leading 0xFF
+								-- and the 6 cmd bytes); first byte with bit7='0' is the R1 response.
+								-- For CMD8, the 4-byte echo follows R1; the check pattern (0xAA) is at
+								-- byte R1_pos + 4. Only positions 0..2 leave room for a full echo.
+								if    RX_Data_A(55) = '0' then
+									R1_response   <= RX_Data_A(55 downto 48);
+									Echo_response <= RX_Data_A(23 downto 16);
+									R1_pos        <= 0;
+								elsif RX_Data_A(47) = '0' then
+									R1_response   <= RX_Data_A(47 downto 40);
+									Echo_response <= RX_Data_A(15 downto  8);
+									R1_pos        <= 1;
+								elsif RX_Data_A(39) = '0' then
+									R1_response   <= RX_Data_A(39 downto 32);
+									Echo_response <= RX_Data_A( 7 downto  0);
+									R1_pos        <= 2;
+								elsif RX_Data_A(31) = '0' then
+									R1_response   <= RX_Data_A(31 downto 24);
+									Echo_response <= x"00";
+									R1_pos        <= 3;
+								elsif RX_Data_A(23) = '0' then
+									R1_response   <= RX_Data_A(23 downto 16);
+									Echo_response <= x"00";
+									R1_pos        <= 4;
+								elsif RX_Data_A(15) = '0' then
+									R1_response   <= RX_Data_A(15 downto  8);
+									Echo_response <= x"00";
+									R1_pos        <= 5;
+								elsif RX_Data_A( 7) = '0' then
+									R1_response   <= RX_Data_A( 7 downto  0);
+									Echo_response <= x"00";
+									R1_pos        <= 6;
+								else
+									R1_response   <= x"FF";
+									Echo_response <= x"00";
+									R1_pos        <= 7;
+								end if;
 							state_A <= continue;
 						elsif wd_count >= 50000000 then -- 1 s @ 50 MHz: SPI never finished
 							TX_Start_A <= '0';
@@ -253,7 +297,7 @@ SD_CARD_READ: entity work.SPI_Master --read i byte by byte (slooow)
 								cmd_count <= cmd_count +1;
 								case cmd_count is
 									when 2 => --check response of CMD0
-										if (( R1_response /= x"01") and ( R1_response_2 /= x"01")) then
+										if R1_response /= x"01" then
 											if (attempts < 8) then
 												cmd_count <= 2; --repeat
 												attempts <= attempts +1;
@@ -269,7 +313,9 @@ SD_CARD_READ: entity work.SPI_Master --read i byte by byte (slooow)
 											state_A <= send_read_request; -- next cmd to send
 										end if;
 									when 3 => --check response of CMD8
-										if ( ( R1_response /= x"01") or (Echo_response /= x"AA")) then
+										-- R1_pos > 2 means the 4-byte echo did not fit into the captured
+										-- response window -> treat as unsupported (same blink code 3).
+										if (R1_response /= x"01") or (Echo_response /= x"AA") or (R1_pos > 2) then
 											-- Most likely: SDv1.x card answers CMD8 with illegal-command (R1 = 0x05).
 											-- We do not implement the SDv1 init path -> report cleanly instead of hanging.
 											err_code <= 3;
@@ -280,7 +326,7 @@ SD_CARD_READ: entity work.SPI_Master --read i byte by byte (slooow)
 											state_A <= send_read_request; -- next cmd to send
 										end if;
 									when 5 => -- count 5 is SD card init--repeat CMD55 & ACMD41 until card is READY
-										if (( R1_response /= x"00") and ( R1_response_2 /= x"00")) then
+										if R1_response /= x"00" then
 											-- Reduced from 5000 (->500 s) to 100 (->~10 s) which is well above
 											-- the ~1 s typical SD power-up time per spec.
 											if (attempts < 100) then
@@ -350,6 +396,14 @@ SD_CARD_READ: entity work.SPI_Master --read i byte by byte (slooow)
 						   if RX_Data_R = x"FE" then
 								wd_count <= 0; -- 0xFE found: re-arm watchdog for the next sector
 								state_A <= sector_read; --flag found, next byte is data
+							elsif (RX_Data_R(7 downto 4) = "0000") and (RX_Data_R(3 downto 0) /= "0000") then
+								-- Data error token: high nibble 0, low nibble carries the error bits
+								-- (0=Error, 1=CC error, 2=ECC failed, 3=out-of-range). Card aborted
+								-- the sector read; bail out cleanly instead of waiting for the watchdog.
+								err_code        <= 6;
+								blink_remaining <= 6;
+								counter         <= 0;
+								state_A         <= error;
 							else
 								state_A <= initiate_read_sector; --next byte to read and check
 							end if;
