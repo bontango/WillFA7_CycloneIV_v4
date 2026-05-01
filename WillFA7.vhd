@@ -22,7 +22,8 @@
 -- v3.13 with eeprom v094 which has reduced clock to 100KHz (old 1MHz)
 -- v3.14 solenoid 17 with peak filter as we have 9uS peaks each 2mS on sp_solenoid_mpu(1);
 -- v3.15 Quartus 22.1, claude debug session: timing corrected, mem_clk confirmed, BT28 (SYS3 settings) corrected
--- v3.16 eeprom write robustnes
+-- v3.16 intermidiate with possible 'CONTACT' patch for special solenoid
+-- v3.17 eeprom write robustnes
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -269,7 +270,7 @@ signal is_sys3 : std_logic; -- '1' for System3/4 (game_select 0-8)
 -- SW version
 constant SW_MAIN : std_logic_vector(3 downto 0) := x"3";
 constant SW_SUB1 : std_logic_vector(3 downto 0) := x"1";
-constant SW_SUB2 : std_logic_vector(3 downto 0) := x"6";
+constant SW_SUB2 : std_logic_vector(3 downto 0) := x"7";
 
 begin
 

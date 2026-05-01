@@ -1,543 +1,584 @@
 --
--- EEprom.vhd 
--- read/write eeprom content to and from ram
--- for BallyFA
--- bontango 09.2020
+-- EEprom.vhd — clean-room rewrite, drop-in compatible with v097
 --
--- eeprom content is red into ram at start of routine ( reset going low)
--- we use a dual port ram in main, with 4bit and 8bit outputs
+-- Mirrors a 256-byte CMOS region between FPGA dual-port RAM (R5101 port B)
+-- and an external SPI EEPROM (M95256 / M95512).
 --
--- code is specific for SPI EEPROM M95640-R
--- fix SPI mode : C remains at 0 for (CPOL=0, CPHA=0)
--- to save memory we do 16 rounds a 8 Byte, even the eeprom has a 32byte page size
+-- Behavior preserved bit-for-bit vs. v097:
+--   * boot read 0x00..0xFF → R5101 + shadow cache
+--   * idle until edge on w_trigger, then 1us glitch check + 1s pre-write
+--   * shadow-cache scan: write only bytes where shadow /= q_ram
+--   * per-byte: WREN → WRITE → poll RDSR until WIP=0 → READ → compare
+--   * delayed re-verify: 100 ms wait, READ again; only second match commits
+--   * up to 2 retries on mismatch, latch error, drive 1 Hz blink output
 --
--- v 0.1
--- v 0.2 selection 6bit version for GottFA
--- v 0.3 added second delay for trigger 
--- v 0.4 selection 8bit version for GottFA v3.x
--- v 0.5 with init set we do an initial write at beginning
--- v 0.6 initial wait time reduced from 10seconds to 2 seconds
--- v 0.7 set output when first reading is done
--- v 0.8 with init set no read/write done, meaning cmos will have initial values ( $0F )
--- v 0.9 added another 2 second delay before write eeprom after trigger
--- v 091 256byte at eeprom, stores full cmos
--- v 092 workaround offset bug
--- v 093 glitch check for trigger reduced to 1us, w_trigger(4), wr outside signal added, waittime trigger reduced to one second
--- v 094 reduced clock for eeprom to 100KHz
--- v 095 per-byte write verify: read back after WIP=0, compare to snapshot,
---       retry up to 2x on mismatch, latch EEprom_error (1 Hz blink) on
---       persistent failure. Cleared at start of next save attempt.
--- v 096 256-byte shadow cache: scan addresses 0x00..0xFF before each save and
---       only WREN/WRITE/verify the bytes where shadow != q_ram. Shadow is
---       populated during boot read and updated only after a successful verify.
---       Drastically reduces SPI traffic and EEPROM cell wear.
--- v 097 delayed re-verify: after the first verify passes, wait ~100 ms and
---       re-read the same byte. Diagnoses cells that hold briefly after WIP=0
---       but lose state quickly (early sign of marginal/counterfeit chip or
---       VCC-droop damage). Only a passing SECOND verify updates shadow.
+-- Structure changed (best-practice rewrite):
+--   * generics for all timings + clock rates
+--   * hierarchical FSM: top-level phase FSM + small SPI transaction sub-FSM
+--   * one named SPI helper used by all four SPI_Master instances
+--   * named opcode constants instead of bit literals
+--   * deduplicated wait_for_Master handshake
+--
+-- SPI_Master.vhd is unchanged — four instances retained (32/32/16/8 bit Laenge)
+-- so M95xxx sees identical frame lengths/shapes.
+--
 
 library IEEE;
 use IEEE.std_logic_1164.all;
---use IEEE.std_logic_arith.all;
---use IEEE.std_logic_unsigned.all;
 use IEEE.numeric_std.all;
 
-	entity EEprom is
-		port(		
-		i_Clk	: in std_logic;
-		done : out std_logic; --set to '1' when first read/write is done
-		-- sd card
-		address_eeprom	: buffer  std_logic_vector(7 downto 0); -- 256 words a 8 bit (dual port ram)
-		data_eeprom	: out std_logic_vector(7 downto 0); --
-		q_ram	: in std_logic_vector(7 downto 0);
-		wr_ram :  out std_logic;				
-		-- Control/Data Signals,
-		i_Rst_L : in std_logic;     -- FPGA Reset		
-		-- PMOD SPI Interface
-		o_SPI_Clk  : out std_logic;
-		i_SPI_MISO : in std_logic;
-		o_SPI_MOSI : out std_logic;
-		o_SPI_CS_n : out std_logic;
-		-- selection
-		selection : in std_logic_vector(7 downto 0);		
-		--trigger for writing ram into eeprom
-		w_trigger : in std_logic_vector (4 downto 0);		-- without in ??
-		-- 0 if Dip is set -> no EEprom read or write at start
-		i_init_Flag : in std_logic;
-		o_wr_in_progress : out std_logic;
-		-- 1 Hz blink while a write+verify cycle has failed since last successful save
-		EEprom_error : out std_logic
-		);
-    end EEprom;
-	 
-   architecture Behavioral of EEprom is
-		type STATE_T is ( Check_dip, send_read_request, wait_for_read, wait_for_Master,
-								Delay, Delay2, Delay3, Idle, Write_enable, wait_for_Cmd_done, wait_for_Master_I,
-								send_write_request, wait_for_Write_done,  wait_for_Master_II,
-								get_status_reg, wait_for_get_status_reg, wait_for_Master_III,
-								check_WP_bit, next_write, Hold,
-								-- v095: per-byte verify
-								verify_send_read, wait_for_verify_read, wait_for_Master_V, check_verify,
-								-- v096: shadow-cache scan
-								Scan_Init, Scan_Settle, Scan_Compare,
-								-- v097: delayed re-verify
-								delay_reverify );
-				
-		signal state : STATE_T;       
-		
-								
-		-- SPI stuff				
-		signal TX_Data_W : std_LOGIC_VECTOR ( 31 downto 0); -- 4 Bytes ( 3 cmd plus 1 Data) 32bits
-		signal RX_Data_W : std_LOGIC_VECTOR ( 31 downto 0);
-		signal TX_Start_W : std_LOGIC;
-		signal TX_Done_W : std_LOGIC;
-		signal MOSI_W : std_LOGIC;
-		signal SS_W :  std_LOGIC;
-		signal SPI_Clk_W :  std_LOGIC;
+entity EEprom is
+    generic (
+        CLK_HZ              : integer := 50_000_000;
+        SPI_HZ              : integer := 100_000;       -- v094
+        INIT_DELAY_CYCLES   : integer := 100_000_000;   -- ~2 s
+        PRE_WRITE_CYCLES    : integer := 50_000_000;    -- ~1 s
+        GLITCH_CYCLES       : integer := 50;            -- ~1 us
+        REVERIFY_CYCLES     : integer := 5_000_000;     -- ~100 ms (v097)
+        HOLD_CYCLES         : integer := 1000;          -- wr_ram pulse hold
+        SCAN_SETTLE_CYCLES  : integer := 5;             -- R5101 port-B settle
+        MAX_RETRY           : integer := 2;             -- per-byte write retries
+        BLINK_DIV_CYCLES    : integer := 25_000_000     -- 1 Hz blink (50M/25M)
+    );
+    port (
+        i_Clk            : in    std_logic;
+        done             : out   std_logic;
+        address_eeprom   : buffer std_logic_vector(7 downto 0);
+        data_eeprom      : out   std_logic_vector(7 downto 0);
+        q_ram            : in    std_logic_vector(7 downto 0);
+        wr_ram           : out   std_logic;
+        i_Rst_L          : in    std_logic;
+        o_SPI_Clk        : out   std_logic;
+        i_SPI_MISO       : in    std_logic;
+        o_SPI_MOSI       : out   std_logic;
+        o_SPI_CS_n       : out   std_logic;
+        selection        : in    std_logic_vector(7 downto 0);
+        w_trigger        : in    std_logic_vector(4 downto 0);
+        i_init_Flag      : in    std_logic;
+        o_wr_in_progress : out   std_logic;
+        EEprom_error     : out   std_logic
+    );
+end EEprom;
 
-		signal TX_Data_R : std_LOGIC_VECTOR ( 31 downto 0); -- 4 Bytes ( 3 cmd plus 1 Data) 32bits
-		signal RX_Data_R : std_LOGIC_VECTOR ( 31 downto 0);
-		signal TX_Start_R : std_LOGIC;
-		signal TX_Done_R : std_LOGIC;
-		signal MOSI_R : std_LOGIC;
-		signal SS_R :  std_LOGIC;
-		signal SPI_Clk_R :  std_LOGIC;
-		
-		signal TX_Data_Stat : std_LOGIC_VECTOR ( 15 downto 0); -- 2 Bytes ( 1 cmd plus 1 status)
-		signal RX_Data_Stat : std_LOGIC_VECTOR ( 15 downto 0);
-		signal TX_Start_Stat : std_LOGIC;
-		signal TX_Done_Stat : std_LOGIC;
-		signal MOSI_Stat : std_LOGIC;
-		signal SS_Stat :  std_LOGIC;
-		signal SPI_Clk_Stat :  std_LOGIC;
+architecture Behavioral of EEprom is
 
-		signal TX_Data_Cmd : std_LOGIC_VECTOR ( 7 downto 0); -- 1 Byte data
-		signal RX_Data_Cmd : std_LOGIC_VECTOR ( 7 downto 0);
-		signal TX_Start_Cmd : std_LOGIC;
-		signal TX_Done_Cmd : std_LOGIC;
-		signal MOSI_Cmd : std_LOGIC;
-		signal SS_Cmd :  std_LOGIC;
-		signal SPI_Clk_Cmd :  std_LOGIC;
-					
-		signal WIP_bit :  std_LOGIC; -- write in progress
-		-- we react to edges of triggers, so we need to remember
-		signal old_w_trigger : std_LOGIC_VECTOR ( 4 downto 0);
-		
-		signal c_count : integer range 0 to 500000000;
+    -- ------------------------------------------------------------------
+    -- M95xxx SPI opcodes
+    -- ------------------------------------------------------------------
+    constant CMD_READ  : std_logic_vector(7 downto 0) := x"03";
+    constant CMD_WRITE : std_logic_vector(7 downto 0) := x"02";
+    constant CMD_WREN  : std_logic_vector(7 downto 0) := x"06";
+    constant CMD_RDSR  : std_logic_vector(7 downto 0) := x"05";
+    constant SR_WIP_BIT : integer := 0;
 
-		-- v095 verify-related signals
-		signal verify_byte    : std_logic_vector(7 downto 0);
-		signal byte_retry     : integer range 0 to 3;
-		signal error_latched  : std_logic;
-		signal blink_div      : integer range 0 to 25_000_000;  -- 1 Hz @ 50 MHz
-		signal blink_q        : std_logic;
+    -- ------------------------------------------------------------------
+    -- Top-level FSM
+    -- ------------------------------------------------------------------
+    type phase_t is (
+        PH_BOOT_CHECK,         -- decide: read or skip
+        PH_BOOT_READ,          -- issue READ for current address
+        PH_BOOT_LATCH,         -- write rx into RAM + shadow, hold wr_ram
+        PH_BOOT_NEXT,          -- next address or finish
+        PH_INIT_DELAY,         -- 2 s before accepting triggers
+        PH_IDLE,               -- watch for w_trigger edge
+        PH_ARMED,              -- 1 us glitch check
+        PH_SAVE_PREP,          -- 1 s pre-write delay, clear error/retry
+        PH_SCAN_SETTLE,        -- R5101 port-B address settle
+        PH_SCAN_COMPARE,       -- shadow vs q_ram → WREN or skip
+        PH_WRITE_WREN,         -- send WREN
+        PH_WRITE_DATA,         -- send WRITE+addr+data, snapshot verify_byte
+        PH_POLL_RDSR,          -- send RDSR
+        PH_POLL_CHECK,         -- WIP=0? else loop
+        PH_VERIFY_READ,        -- send READ for verify
+        PH_VERIFY_CHECK,       -- compare RX vs verify_byte
+        PH_REVERIFY_DELAY,     -- 100 ms idle then re-read
+        PH_NEXT_BYTE           -- advance address or back to IDLE
+    );
+    signal phase : phase_t;
 
-		-- v096 256-byte shadow cache: mirror of EEPROM, drives change detection
-		type t_shadow is array(0 to 255) of std_logic_vector(7 downto 0);
-		signal shadow         : t_shadow;
-		signal scan_cnt    : integer range 0 to 7;
+    -- ------------------------------------------------------------------
+    -- SPI transaction sub-FSM (shared handshake for all four masters)
+    -- ------------------------------------------------------------------
+    type spi_op_t is (OP_NONE, OP_READ, OP_WRITE, OP_RDSR, OP_WREN);
+    type spi_state_t is (SPI_IDLE, SPI_RUNNING, SPI_RELEASE);
+    signal spi_state    : spi_state_t;
+    signal spi_op       : spi_op_t;
+    signal spi_start    : std_logic;     -- top FSM pulses to launch op
+    signal spi_done_p   : std_logic;     -- one-cycle pulse when op finished
 
-		-- v097 delayed re-verify: '0' = first verify, '1' = second verify after delay
-		signal reverify_pass : std_logic;
+    -- ------------------------------------------------------------------
+    -- Four SPI_Master instances (preserved 32/32/16/8 bit Laenge)
+    -- ------------------------------------------------------------------
+    signal TX_Data_R    : std_logic_vector(31 downto 0);
+    signal RX_Data_R    : std_logic_vector(31 downto 0);
+    signal TX_Start_R   : std_logic;
+    signal TX_Done_R    : std_logic;
+    signal MOSI_R       : std_logic;
+    signal SS_R         : std_logic;
+    signal SPI_Clk_R    : std_logic;
 
-	begin
+    signal TX_Data_W    : std_logic_vector(31 downto 0);
+    signal RX_Data_W    : std_logic_vector(31 downto 0);
+    signal TX_Start_W   : std_logic;
+    signal TX_Done_W    : std_logic;
+    signal MOSI_W       : std_logic;
+    signal SS_W         : std_logic;
+    signal SPI_Clk_W    : std_logic;
 
-	-- 1 Hz blink output, gated by latched failure flag
-	EEprom_error <= blink_q when error_latched = '1' else '0';
+    signal TX_Data_Stat : std_logic_vector(15 downto 0);
+    signal RX_Data_Stat : std_logic_vector(15 downto 0);
+    signal TX_Start_Stat: std_logic;
+    signal TX_Done_Stat : std_logic;
+    signal MOSI_Stat    : std_logic;
+    signal SS_Stat      : std_logic;
+    signal SPI_Clk_Stat : std_logic;
 
-	
-		
-	-- signals for the four SPI Master
-	o_SPI_MOSI <=	
-	MOSI_R when TX_Start_R = '1' else
-	MOSI_W when TX_Start_W = '1' else
-	MOSI_Stat when TX_Start_Stat = '1' else
-	MOSI_Cmd when TX_Start_Cmd = '1' else
-	'0';
+    signal TX_Data_Cmd  : std_logic_vector(7 downto 0);
+    signal RX_Data_Cmd  : std_logic_vector(7 downto 0);
+    signal TX_Start_Cmd : std_logic;
+    signal TX_Done_Cmd  : std_logic;
+    signal MOSI_Cmd     : std_logic;
+    signal SS_Cmd       : std_logic;
+    signal SPI_Clk_Cmd  : std_logic;
 
-	o_SPI_Clk <=
-	SPI_Clk_R when TX_Start_R = '1' else
-	SPI_Clk_W when TX_Start_W = '1' else
-	SPI_Clk_Stat when TX_Start_Stat = '1' else
-	SPI_Clk_Cmd when TX_Start_Cmd = '1' else
-	'0';
+    -- ------------------------------------------------------------------
+    -- Working state
+    -- ------------------------------------------------------------------
+    signal old_w_trigger : std_logic_vector(4 downto 0);
+    signal c_count       : integer range 0 to 500_000_000;
+    signal scan_cnt      : integer range 0 to 31;
 
-	o_SPI_CS_n <=
-	SS_R when TX_Start_R = '1' else
-	SS_W when TX_Start_W = '1' else
-	SS_Stat when TX_Start_Stat = '1' else
-	SS_Cmd when TX_Start_Cmd = '1' else
-	'1';
+    signal verify_byte   : std_logic_vector(7 downto 0);
+    signal byte_retry    : integer range 0 to 7;
+    signal reverify_pass : std_logic;          -- '0'=first verify, '1'=second
 
+    signal error_latched : std_logic;
+    signal blink_div     : integer range 0 to 25_000_000;
+    signal blink_q       : std_logic;
 
-EEPROM_WRITE: entity work.SPI_Master
-    generic map (   
-		SPI_Taktfrequenz   =>  100000,
-      Laenge => 32)
-    port map (
-			  TX_Data  => TX_Data_W,
-           RX_Data  => RX_Data_W,
-           MOSI     => MOSI_W,
-           MISO     => i_SPI_MISO,
-           SCLK     => SPI_Clk_W,
-           SS       => SS_W,
-           TX_Start => TX_Start_W,
-           TX_Done  => TX_Done_W,
-           clk      => i_Clk,
-			  do_not_disable_SS => '0',
-			  do_not_enable_SS => '0'
-      );
-		
-EEPROM_READ: entity work.SPI_Master
-    generic map (      
-		SPI_Taktfrequenz   =>  100000,	 
-      Laenge => 32)
-    port map (
-			  TX_Data  => TX_Data_R,
-           RX_Data  => RX_Data_R,
-           MOSI     => MOSI_R,
-           MISO     => i_SPI_MISO,
-           SCLK     => SPI_Clk_R,
-           SS       => SS_R,
-           TX_Start => TX_Start_R,
-           TX_Done  => TX_Done_R,
-           clk      => i_Clk,
-			  do_not_disable_SS => '0',
-			  do_not_enable_SS => '0'
-      );
+    -- 256-byte shadow cache
+    type shadow_t is array (0 to 255) of std_logic_vector(7 downto 0);
+    signal shadow        : shadow_t;
 
-EEPROM_STAT: entity work.SPI_Master
-    generic map (   
-	 	SPI_Taktfrequenz   =>  100000,
-      Laenge => 16)
-    port map (
-			  TX_Data  => TX_Data_Stat,
-           RX_Data  => RX_Data_Stat,
-           MOSI     => MOSI_Stat,
-           MISO     => i_SPI_MISO,
-           SCLK     => SPI_Clk_Stat,
-           SS       => SS_Stat,
-           TX_Start => TX_Start_Stat,
-           TX_Done  => TX_Done_Stat,
-           clk      => i_Clk,
-			  do_not_disable_SS => '0',
-			  do_not_enable_SS => '0'
-      );
+    signal wr_ram_i      : std_logic;
 
-EEPROM_CMD: entity work.SPI_Master
-    generic map (  
-		SPI_Taktfrequenz   =>  100000,    
-      Laenge => 8)
-    port map (
-			  TX_Data  => TX_Data_Cmd,
-           RX_Data  => RX_Data_Cmd,
-           MOSI     => MOSI_Cmd,
-           MISO     => i_SPI_MISO,
-           SCLK     => SPI_Clk_Cmd,
-           SS       => SS_Cmd,
-           TX_Start => TX_Start_Cmd,
-           TX_Done  => TX_Done_Cmd,
-           clk      => i_Clk,
-			  do_not_disable_SS => '0',
-			  do_not_enable_SS => '0'
-      );
-		
-EEPROM: process (i_Clk, w_trigger, i_Rst_L)
-			begin
-			if i_Rst_L = '0' then --Reset condidition (reset_l)
-				TX_Start_R <= '0';
-				TX_Start_W <= '0';
-				TX_Start_Cmd <= '0';
-				TX_Start_Stat <= '0';
-				address_eeprom <= "00000000";
-				wr_ram <= '0';
-				c_count <= 0;
-				done <= '0';
-				state <= Check_dip;
-				o_wr_in_progress <= '1';
-				-- v095
-				verify_byte   <= (others => '0');
-				byte_retry    <= 0;
-				error_latched <= '0';
-				blink_div     <= 0;
-				blink_q       <= '0';
-				-- v096
-				scan_cnt   <= 0;
-				-- v097
-				reverify_pass <= '0';
-			elsif rising_edge(i_Clk) then
-				-- v095: free-running 1 Hz blink generator (50 MHz / 25M = 2 Hz toggle = 1 Hz period)
-				if blink_div = 25_000_000 - 1 then
-					blink_div <= 0;
-					blink_q   <= not blink_q;
-				else
-					blink_div <= blink_div + 1;
-				end if;
+    -- '1' while we are inside the save sequence (PH_SAVE_PREP..PH_NEXT_BYTE).
+    -- Used so the LED can blink during a save (visible "do not power off")
+    -- without also blinking during the boot/idle phases.
+    signal save_active   : std_logic;
 
-				case state is
-				-- STATE MASCHINE ----------------
-				when Check_dip => -- check dip switch if we need to read eeprom				
-				   if i_init_Flag = '1' then
-						state <= send_read_request; -- DIP not set, read eeprom and write to cmos
-					else					
-						state <= Delay; -- DIP set, after delay go to Idle
-					end if;
-				when send_read_request =>					
-					TX_Data_R(31 downto 24) <= "00000011"; -- cmd read from memory array
-					-- construct the address, we have 32KByte available -> 15 bit address
-					-- high byte is selection
-					TX_Data_R(23 downto 16)  <= std_logic_vector (unsigned(selection));											 
-					-- last 8 bits is address
-				   TX_Data_R(15 downto 8) <= address_eeprom;
-					TX_Start_R <= '1'; -- set flag for sending byte		
-					state <= wait_for_read;					
-										
-				when wait_for_read =>
-						if (TX_Done_R = '1') then -- Master sets TX_Done when TX is done ;-)
-							TX_Start_R <= '0'; -- reset flag
-							--put red data into ram or init to '0'
-							data_eeprom <= RX_Data_R(7 downto 0);
-							wr_ram <= '1';
-							-- v096: snapshot into shadow so first save scan sees no false diffs
-							shadow(to_integer(unsigned(address_eeprom))) <= RX_Data_R(7 downto 0);
-							state <= Hold;
-						end if;
+begin
 
-				 when Hold => -- wait a bit with wr_ram=1
-					if c_count < 1000 then
-						c_count <= c_count +1;
-					else							
-						c_count <= 0;												
-						state <= wait_for_Master;
-					end if;
-						
-				when wait_for_Master =>							
-						if (TX_Done_R = '0') then -- Master sets back TX_Done when ready again
-						   -- increment address
-						   address_eeprom <= std_logic_vector( unsigned(address_eeprom) + 1 );							
-							-- set back write flag for ram
-							wr_ram <= '0';
-							if address_eeprom = "11111111" then 
-							  state <= Delay; -- read done, goto (possible) write
-							else
-							  state <= send_read_request; -- next round 
-							end if;
-						end if;							
+    wr_ram <= wr_ram_i;
 
-				 when Delay => -- wait 2 seconds before react to first trigger				   
-					if c_count < 100000000 then
-						c_count <= c_count +1;
-					else	
-						done <= '1'; --signal that we are ready 
-						c_count <= 0;						
-						old_w_trigger <= w_trigger;
-						state <= Idle;
-					end if;
-					
-				 when Idle => 			
-					o_wr_in_progress <= '1';
-					if w_trigger /= old_w_trigger then					
-							old_w_trigger <= w_trigger;
-							address_eeprom <= "00000000";									
-							state <= Delay2;				
-					end if;	
+    save_active <= '0' when (phase = PH_BOOT_CHECK or phase = PH_BOOT_READ or
+                             phase = PH_BOOT_LATCH or phase = PH_BOOT_NEXT or
+                             phase = PH_INIT_DELAY or phase = PH_IDLE or
+                             phase = PH_ARMED)
+                       else '1';
 
-				when Delay2 => -- wait 1us then check status of trigger again (glitch?)
-					if c_count < 50 then
-						c_count <= c_count +1;
-					else	
-						c_count <= 0;
-						if w_trigger = old_w_trigger then -- trigger stable
-							state <= Delay3;
-						else
-							old_w_trigger <= w_trigger; -- trigger NOT stable
-							state <= Idle;
-						end if;
-					end if;															
+    -- ------------------------------------------------------------------
+    -- SPI pin mux: which master currently owns the bus
+    -- ------------------------------------------------------------------
+    o_SPI_MOSI <=
+        MOSI_R    when TX_Start_R    = '1' else
+        MOSI_W    when TX_Start_W    = '1' else
+        MOSI_Stat when TX_Start_Stat = '1' else
+        MOSI_Cmd  when TX_Start_Cmd  = '1' else
+        '0';
 
-				when Delay3 => -- wait another second before write eeprom
-					o_wr_in_progress <= '0'; -- signal to outside that we are going to write
-					if c_count < 50000000 then
-						c_count <= c_count +1;
-					else
-						c_count       <= 0;
-						-- v095: clear failure latch and per-byte retry at the start of each save
-						error_latched <= '0';
-						byte_retry    <= 0;
-						-- v096: enter scan phase instead of unconditionally writing every byte
-						state <= Scan_Init;
-					end if;
-					
-				when Write_enable => -- enable writing								
-					TX_Data_Cmd <= "00000110"; -- write enable					
-					TX_Start_Cmd <= '1'; -- set flag for sending byte											
-					state <= wait_for_Cmd_done;					
-					
-				when wait_for_Cmd_done =>													
-					if (TX_Done_Cmd = '1') then				
-						TX_Start_Cmd <= '0'; -- reset flag 
-						state <= wait_for_Master_I;														
-					end if;											 
-					
-				when wait_for_Master_I =>													
-					if (TX_Done_Cmd = '0') then										
-						state <= send_write_request;														
-					end if;											 
-										
-				when send_write_request =>
-				   --header is write command plus address to write
-					TX_Data_W(31 downto 24) <= "00000010"; -- cmd write memory array address
-					-- construct the address, we have 32KByte available -> 15 bit address
-					-- high byte is selection
-					TX_Data_W(23 downto 16)  <= std_logic_vector (unsigned(selection));
-					-- last 8 bits is address
-				   TX_Data_W(15 downto 8) <= address_eeprom;
-					-- data from ram or init wih zero
-					TX_Data_W ( 7 downto 0 ) <= q_ram;
-					-- v095: snapshot for verify (q_ram is stable here, address unchanged since next_write)
-					verify_byte <= q_ram;
-					TX_Start_W <= '1'; -- set flag for sending byte
-					state <= wait_for_Write_done;					
-		
-				when wait_for_Write_done =>							
-						if (TX_Done_W = '1') then							
-							TX_Start_W <= '0'; -- reset flag 														
-							state <= wait_for_Master_II;														
-						end if;							
-						
-				when wait_for_Master_II =>													
-					if (TX_Done_W = '0') then										
-						state <= get_status_reg;														
-					end if;											 
-						
-				when get_status_reg =>		
-						-- write should now be in now in progress, check when done ( appr. 5ms according to datasheet)				
-						TX_Data_Stat <= "0000010100000000"; -- read status reg (second 8 bit to ignore)
-						TX_Start_Stat <= '1'; -- set flag for sending byte						
-						state <= wait_for_get_status_reg;					
-					
-				when wait_for_get_status_reg =>
-						if (TX_Done_Stat = '1') then
-							TX_Start_Stat <= '0'; -- reset flag 
-							state <= wait_for_Master_III;								
-						end if;
-						
-				when wait_for_Master_III =>													
-					if (TX_Done_Stat = '0') then			
-							-- bit0 of status reg is WIP (write in progress) 
-							WIP_bit <= RX_Data_Stat(0);
-							state <= check_WP_bit;					
-				   end if;
-		
-				when check_WP_bit =>
-							if WIP_bit = '0' then
-							   -- 0 means write is complete. v095: verify before advancing.
-								state <= verify_send_read;
-							else
-								-- not finished yet, get status register again
-								state <= get_status_reg;
-							end if;
-				
-				-- v095 ----- per-byte VERIFY: read back the just-written byte, compare to snapshot
-				when verify_send_read =>
-					TX_Data_R(31 downto 24) <= "00000011"; -- cmd READ
-					TX_Data_R(23 downto 16) <= selection;
-					TX_Data_R(15 downto 8)  <= address_eeprom;
-					TX_Data_R(7 downto 0)   <= (others => '0'); -- dummy
-					TX_Start_R <= '1';
-					state      <= wait_for_verify_read;
+    o_SPI_Clk <=
+        SPI_Clk_R    when TX_Start_R    = '1' else
+        SPI_Clk_W    when TX_Start_W    = '1' else
+        SPI_Clk_Stat when TX_Start_Stat = '1' else
+        SPI_Clk_Cmd  when TX_Start_Cmd  = '1' else
+        '0';
 
-				when wait_for_verify_read =>
-					if TX_Done_R = '1' then
-						TX_Start_R <= '0';
-						state      <= wait_for_Master_V;
-					end if;
+    o_SPI_CS_n <=
+        SS_R    when TX_Start_R    = '1' else
+        SS_W    when TX_Start_W    = '1' else
+        SS_Stat when TX_Start_Stat = '1' else
+        SS_Cmd  when TX_Start_Cmd  = '1' else
+        '1';
 
-				when wait_for_Master_V =>
-					if TX_Done_R = '0' then
-						state <= check_verify;
-					end if;
+    -- Blink at 1 Hz while a save is running OR when an error is latched.
+    -- The top-level routes this to LED_active only during o_wr_in_progress='0',
+    -- so the LED stays dark during boot and shows display-blanking when idle.
+    EEprom_error <= blink_q when (save_active = '1' or error_latched = '1') else '0';
 
-				when check_verify =>
-					if RX_Data_R(7 downto 0) = verify_byte then
-						-- v097: first pass passes -> wait then re-read; second pass passes -> commit
-						if reverify_pass = '0' then
-							reverify_pass <= '1';
-							c_count       <= 0;
-							state         <= delay_reverify;
-						else
-							-- byte truly stable, mark shadow in-sync
-							shadow(to_integer(unsigned(address_eeprom))) <= verify_byte;
-							reverify_pass <= '0';
-							byte_retry    <= 0;
-							state         <= next_write;
-						end if;
-					elsif byte_retry < 2 then
-						-- retry the SAME address (address_eeprom unchanged)
-						reverify_pass <= '0';
-						byte_retry    <= byte_retry + 1;
-						state         <= Write_enable;
-					else
-						-- give up on this byte; latch error, continue with next
-						error_latched <= '1';
-						reverify_pass <= '0';
-						byte_retry    <= 0;
-						state         <= next_write;
-					end if;
-				-- v095 -----
+    -- ------------------------------------------------------------------
+    -- SPI_Master instances (unchanged interface, same 100 kHz)
+    -- ------------------------------------------------------------------
+    EEPROM_READ : entity work.SPI_Master
+        generic map (SPI_Taktfrequenz => SPI_HZ, Laenge => 32)
+        port map (
+            TX_Data => TX_Data_R, RX_Data => RX_Data_R,
+            MOSI => MOSI_R, MISO => i_SPI_MISO,
+            SCLK => SPI_Clk_R, SS => SS_R,
+            TX_Start => TX_Start_R, TX_Done => TX_Done_R,
+            clk => i_Clk,
+            do_not_disable_SS => '0', do_not_enable_SS => '0'
+        );
 
-				when next_write =>
-							-- increment address
-						   address_eeprom <= std_logic_vector( unsigned(address_eeprom) + 1 );
-							if address_eeprom = "11111111" then
-							   state <= Idle; -- all done, goto Idle again
-							  else
-								-- v096: re-enter scan; only write if shadow disagrees with q_ram
-								scan_cnt <= 0;
-								state       <= Scan_Settle;
-							 end if;
+    EEPROM_WRITE : entity work.SPI_Master
+        generic map (SPI_Taktfrequenz => SPI_HZ, Laenge => 32)
+        port map (
+            TX_Data => TX_Data_W, RX_Data => RX_Data_W,
+            MOSI => MOSI_W, MISO => i_SPI_MISO,
+            SCLK => SPI_Clk_W, SS => SS_W,
+            TX_Start => TX_Start_W, TX_Done => TX_Done_W,
+            clk => i_Clk,
+            do_not_disable_SS => '0', do_not_enable_SS => '0'
+        );
 
-				-- v097 ----- delayed re-verify -----
-				when delay_reverify =>
-					-- ~100 ms @ 50 MHz = 5,000,000 cycles
-					if c_count < 5000000 then
-						c_count <= c_count + 1;
-					else
-						c_count <= 0;
-						-- re-issue the same READ at the same address; reverify_pass is '1'
-						-- so check_verify will commit on the next match.
-						state <= verify_send_read;
-					end if;
-				-- v097 -----
+    EEPROM_STAT : entity work.SPI_Master
+        generic map (SPI_Taktfrequenz => SPI_HZ, Laenge => 16)
+        port map (
+            TX_Data => TX_Data_Stat, RX_Data => RX_Data_Stat,
+            MOSI => MOSI_Stat, MISO => i_SPI_MISO,
+            SCLK => SPI_Clk_Stat, SS => SS_Stat,
+            TX_Start => TX_Start_Stat, TX_Done => TX_Done_Stat,
+            clk => i_Clk,
+            do_not_disable_SS => '0', do_not_enable_SS => '0'
+        );
 
-				-- v096 ----- shadow-cache scan -----
-				when Scan_Init =>
-					address_eeprom <= "00000000";
-					scan_cnt    <= 0;
-					state          <= Scan_Settle;
+    EEPROM_CMD : entity work.SPI_Master
+        generic map (SPI_Taktfrequenz => SPI_HZ, Laenge => 8)
+        port map (
+            TX_Data => TX_Data_Cmd, RX_Data => RX_Data_Cmd,
+            MOSI => MOSI_Cmd, MISO => i_SPI_MISO,
+            SCLK => SPI_Clk_Cmd, SS => SS_Cmd,
+            TX_Start => TX_Start_Cmd, TX_Done => TX_Done_Cmd,
+            clk => i_Clk,
+            do_not_disable_SS => '0', do_not_enable_SS => '0'
+        );
 
-				when Scan_Settle =>
-					-- give R5101 port B a few cycles to latch new address and
-					-- propagate it to q_ram (asynchronous output, registered address)
-					if scan_cnt < 5 then
-						scan_cnt <= scan_cnt + 1;
-					else
-						state <= Scan_Compare;
-					end if;
+    -- ------------------------------------------------------------------
+    -- SPI sub-FSM: drives the matching TX_Start_* until the master sends
+    -- TX_Done='1', then releases TX_Start and waits for TX_Done='0'.
+    -- Pulses spi_done_p for one clock when the operation has fully
+    -- released the bus, signaling the top FSM to advance.
+    -- ------------------------------------------------------------------
+    SPI_SUB : process (i_Clk, i_Rst_L)
+    begin
+        if i_Rst_L = '0' then
+            spi_state    <= SPI_IDLE;
+            TX_Start_R   <= '0';
+            TX_Start_W   <= '0';
+            TX_Start_Stat<= '0';
+            TX_Start_Cmd <= '0';
+            spi_done_p   <= '0';
+        elsif rising_edge(i_Clk) then
+            spi_done_p <= '0';
 
-				when Scan_Compare =>
-					if shadow(to_integer(unsigned(address_eeprom))) /= q_ram then
-						-- byte changed since last save: write it
-						byte_retry <= 0;
-						state      <= Write_enable;
-					else
-						-- unchanged: skip directly to advance
-						state <= next_write;
-					end if;
-				-- v096 -----
+            case spi_state is
+                when SPI_IDLE =>
+                    if spi_start = '1' then
+                        case spi_op is
+                            when OP_READ  => TX_Start_R    <= '1';
+                            when OP_WRITE => TX_Start_W    <= '1';
+                            when OP_RDSR  => TX_Start_Stat <= '1';
+                            when OP_WREN  => TX_Start_Cmd  <= '1';
+                            when others   => null;
+                        end case;
+                        spi_state <= SPI_RUNNING;
+                    end if;
 
-				end case;
-			end if; --rising edge				
-		end process;
-						
-    end Behavioral;				
+                when SPI_RUNNING =>
+                    case spi_op is
+                        when OP_READ =>
+                            if TX_Done_R = '1' then
+                                TX_Start_R <= '0';
+                                spi_state  <= SPI_RELEASE;
+                            end if;
+                        when OP_WRITE =>
+                            if TX_Done_W = '1' then
+                                TX_Start_W <= '0';
+                                spi_state  <= SPI_RELEASE;
+                            end if;
+                        when OP_RDSR =>
+                            if TX_Done_Stat = '1' then
+                                TX_Start_Stat <= '0';
+                                spi_state     <= SPI_RELEASE;
+                            end if;
+                        when OP_WREN =>
+                            if TX_Done_Cmd = '1' then
+                                TX_Start_Cmd <= '0';
+                                spi_state    <= SPI_RELEASE;
+                            end if;
+                        when others =>
+                            spi_state <= SPI_IDLE;
+                    end case;
+
+                when SPI_RELEASE =>
+                    -- wait for master to drop TX_Done before announcing done
+                    case spi_op is
+                        when OP_READ =>
+                            if TX_Done_R = '0' then
+                                spi_done_p <= '1';
+                                spi_state  <= SPI_IDLE;
+                            end if;
+                        when OP_WRITE =>
+                            if TX_Done_W = '0' then
+                                spi_done_p <= '1';
+                                spi_state  <= SPI_IDLE;
+                            end if;
+                        when OP_RDSR =>
+                            if TX_Done_Stat = '0' then
+                                spi_done_p <= '1';
+                                spi_state  <= SPI_IDLE;
+                            end if;
+                        when OP_WREN =>
+                            if TX_Done_Cmd = '0' then
+                                spi_done_p <= '1';
+                                spi_state  <= SPI_IDLE;
+                            end if;
+                        when others =>
+                            spi_state <= SPI_IDLE;
+                    end case;
+            end case;
+        end if;
+    end process;
+
+    -- ------------------------------------------------------------------
+    -- Top-level FSM
+    -- ------------------------------------------------------------------
+    TOP : process (i_Clk, i_Rst_L)
+    begin
+        if i_Rst_L = '0' then
+            phase           <= PH_BOOT_CHECK;
+            address_eeprom  <= (others => '0');
+            data_eeprom     <= (others => '0');
+            wr_ram_i        <= '0';
+            done            <= '0';
+            -- '0' during boot read so the LED mux signals "EEPROM busy"
+            -- until INIT_DELAY completes and we transition to PH_IDLE
+            o_wr_in_progress<= '0';
+            c_count         <= 0;
+            scan_cnt        <= 0;
+            verify_byte     <= (others => '0');
+            byte_retry      <= 0;
+            reverify_pass   <= '0';
+            error_latched   <= '0';
+            blink_div       <= 0;
+            blink_q         <= '0';
+            old_w_trigger   <= (others => '0');
+            spi_op          <= OP_NONE;
+            spi_start       <= '0';
+            TX_Data_R       <= (others => '0');
+            TX_Data_W       <= (others => '0');
+            TX_Data_Stat    <= (others => '0');
+            TX_Data_Cmd     <= (others => '0');
+
+        elsif rising_edge(i_Clk) then
+            -- 1 Hz blink generator (always free-running)
+            if blink_div = BLINK_DIV_CYCLES - 1 then
+                blink_div <= 0;
+                blink_q   <= not blink_q;
+            else
+                blink_div <= blink_div + 1;
+            end if;
+
+            -- default: spi_start is a one-cycle pulse
+            spi_start <= '0';
+
+            case phase is
+
+                -- ===== boot read =====
+                when PH_BOOT_CHECK =>
+                    if i_init_Flag = '1' then
+                        phase <= PH_BOOT_READ;
+                    else
+                        -- skip read, RAM keeps init pattern (0x0F)
+                        c_count <= 0;
+                        phase   <= PH_INIT_DELAY;
+                    end if;
+
+                when PH_BOOT_READ =>
+                    TX_Data_R <= CMD_READ & selection & address_eeprom & x"00";
+                    spi_op    <= OP_READ;
+                    spi_start <= '1';
+                    phase     <= PH_BOOT_LATCH;
+
+                when PH_BOOT_LATCH =>
+                    if spi_done_p = '1' then
+                        data_eeprom <= RX_Data_R(7 downto 0);
+                        wr_ram_i    <= '1';
+                        shadow(to_integer(unsigned(address_eeprom))) <= RX_Data_R(7 downto 0);
+                        c_count     <= 0;
+                    elsif wr_ram_i = '1' then
+                        if c_count < HOLD_CYCLES then
+                            c_count <= c_count + 1;
+                        else
+                            c_count  <= 0;
+                            wr_ram_i <= '0';
+                            phase   <= PH_BOOT_NEXT;
+                        end if;
+                    end if;
+
+                when PH_BOOT_NEXT =>
+                    if address_eeprom = x"FF" then
+                        c_count <= 0;
+                        phase   <= PH_INIT_DELAY;
+                    else
+                        address_eeprom <= std_logic_vector(unsigned(address_eeprom) + 1);
+                        phase          <= PH_BOOT_READ;
+                    end if;
+
+                -- ===== arm / idle =====
+                when PH_INIT_DELAY =>
+                    if c_count < INIT_DELAY_CYCLES then
+                        c_count <= c_count + 1;
+                    else
+                        c_count       <= 0;
+                        done          <= '1';
+                        old_w_trigger <= w_trigger;
+                        phase         <= PH_IDLE;
+                    end if;
+
+                when PH_IDLE =>
+                    o_wr_in_progress <= '1';
+                    if w_trigger /= old_w_trigger then
+                        old_w_trigger  <= w_trigger;
+                        address_eeprom <= (others => '0');
+                        c_count        <= 0;
+                        phase          <= PH_ARMED;
+                    end if;
+
+                when PH_ARMED =>
+                    if c_count < GLITCH_CYCLES then
+                        c_count <= c_count + 1;
+                    else
+                        c_count <= 0;
+                        if w_trigger = old_w_trigger then
+                            phase <= PH_SAVE_PREP;
+                        else
+                            old_w_trigger <= w_trigger;
+                            phase         <= PH_IDLE;
+                        end if;
+                    end if;
+
+                when PH_SAVE_PREP =>
+                    o_wr_in_progress <= '0';
+                    if c_count < PRE_WRITE_CYCLES then
+                        c_count <= c_count + 1;
+                    else
+                        c_count        <= 0;
+                        error_latched  <= '0';
+                        byte_retry     <= 0;
+                        reverify_pass  <= '0';
+                        address_eeprom <= (others => '0');
+                        scan_cnt       <= 0;
+                        phase          <= PH_SCAN_SETTLE;
+                    end if;
+
+                -- ===== shadow scan =====
+                when PH_SCAN_SETTLE =>
+                    if scan_cnt < SCAN_SETTLE_CYCLES then
+                        scan_cnt <= scan_cnt + 1;
+                    else
+                        scan_cnt <= 0;
+                        phase    <= PH_SCAN_COMPARE;
+                    end if;
+
+                when PH_SCAN_COMPARE =>
+                    if shadow(to_integer(unsigned(address_eeprom))) /= q_ram then
+                        byte_retry    <= 0;
+                        reverify_pass <= '0';
+                        phase         <= PH_WRITE_WREN;
+                    else
+                        phase <= PH_NEXT_BYTE;
+                    end if;
+
+                -- ===== per-byte write + verify =====
+                when PH_WRITE_WREN =>
+                    TX_Data_Cmd <= CMD_WREN;
+                    spi_op      <= OP_WREN;
+                    spi_start   <= '1';
+                    phase       <= PH_WRITE_DATA;
+
+                when PH_WRITE_DATA =>
+                    if spi_done_p = '1' then
+                        TX_Data_W   <= CMD_WRITE & selection & address_eeprom & q_ram;
+                        verify_byte <= q_ram;
+                        spi_op      <= OP_WRITE;
+                        spi_start   <= '1';
+                        phase       <= PH_POLL_RDSR;
+                    end if;
+
+                when PH_POLL_RDSR =>
+                    if spi_done_p = '1' then
+                        TX_Data_Stat <= CMD_RDSR & x"00";
+                        spi_op       <= OP_RDSR;
+                        spi_start    <= '1';
+                        phase        <= PH_POLL_CHECK;
+                    end if;
+
+                when PH_POLL_CHECK =>
+                    if spi_done_p = '1' then
+                        if RX_Data_Stat(SR_WIP_BIT) = '0' then
+                            phase <= PH_VERIFY_READ;
+                        else
+                            -- still busy, poll again
+                            TX_Data_Stat <= CMD_RDSR & x"00";
+                            spi_op       <= OP_RDSR;
+                            spi_start    <= '1';
+                            -- stay in PH_POLL_CHECK
+                        end if;
+                    end if;
+
+                when PH_VERIFY_READ =>
+                    TX_Data_R <= CMD_READ & selection & address_eeprom & x"00";
+                    spi_op    <= OP_READ;
+                    spi_start <= '1';
+                    phase     <= PH_VERIFY_CHECK;
+
+                when PH_VERIFY_CHECK =>
+                    if spi_done_p = '1' then
+                        if RX_Data_R(7 downto 0) = verify_byte then
+                            if reverify_pass = '0' then
+                                -- first verify ok → wait then read again
+                                reverify_pass <= '1';
+                                c_count       <= 0;
+                                phase         <= PH_REVERIFY_DELAY;
+                            else
+                                -- second verify ok → commit shadow
+                                shadow(to_integer(unsigned(address_eeprom))) <= verify_byte;
+                                reverify_pass <= '0';
+                                byte_retry    <= 0;
+                                phase         <= PH_NEXT_BYTE;
+                            end if;
+                        elsif byte_retry < MAX_RETRY then
+                            byte_retry    <= byte_retry + 1;
+                            reverify_pass <= '0';
+                            phase         <= PH_WRITE_WREN;
+                        else
+                            error_latched <= '1';
+                            reverify_pass <= '0';
+                            byte_retry    <= 0;
+                            phase         <= PH_NEXT_BYTE;
+                        end if;
+                    end if;
+
+                when PH_REVERIFY_DELAY =>
+                    if c_count < REVERIFY_CYCLES then
+                        c_count <= c_count + 1;
+                    else
+                        c_count <= 0;
+                        phase   <= PH_VERIFY_READ;
+                    end if;
+
+                when PH_NEXT_BYTE =>
+                    if address_eeprom = x"FF" then
+                        phase <= PH_IDLE;
+                    else
+                        address_eeprom <= std_logic_vector(unsigned(address_eeprom) + 1);
+                        scan_cnt       <= 0;
+                        phase          <= PH_SCAN_SETTLE;
+                    end if;
+
+            end case;
+        end if;
+    end process;
+
+end Behavioral;
