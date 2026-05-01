@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-WillFA7 is a VHDL-based FPGA implementation that emulates Williams System 7 pinball machine MPU hardware on an Altera Cyclone IV EP4CE6E22C8 FPGA. Author: Ralf Thelen (bontango), website: www.lisy.dev. Current version: 3.15.
+WillFA7 is a VHDL-based FPGA implementation that emulates Williams System 7 pinball machine MPU hardware on an Altera Cyclone IV EP4CE6E22C8 FPGA. Author: Ralf Thelen (bontango), website: www.lisy.dev. Current version: 3.17.
 
 ## Build System
 
@@ -32,7 +32,7 @@ quartus_sh --flow compile WillFA7
 | cpu68 | `cpu68.vhd` | Motorola 6800/6801 CPU core (OpenCores, modified) |
 | pia6821 | `pia6821.vhd` | Peripheral Interface Adapter (x5 instances) |
 | SD_Card | `SD_Card.vhd` | SPI SD card controller for ROM loading |
-| EEprom | `EEprom.vhd` | SPI EEPROM interface (M95640-R, game state persistence) |
+| EEprom | `EEprom.vhd` | SPI EEPROM interface (M95256 / M95512, game state persistence) |
 | williams_pll | `williams_pll.vhd` | PLL: 50 MHz → 14.28 MHz (Altera IP) |
 | ram | `ram.vhd` | System RAM (Altera 1-port syncram IP) |
 | rom_2K | `rom_2K.vhd` | ROM blocks x6 (Altera IP, loaded from SD) |
@@ -83,3 +83,15 @@ EP4CE6E22C8 (Cyclone IV E, 6272 LEs). Pin assignments in `WillFA7.qsf`. Physical
 - Signal naming follows Williams hardware conventions (e.g., `sw_strobe`, `sw_return`, `sol_1_8_sel`)
 - Active-low signals: reset (`reset_sw`), chip selects (`CS_SDcard`, `CS_EEprom`)
 - Version history maintained in `Archive/` directory
+
+## EEPROM Save Path (`lib_common/EEprom.vhd`)
+
+Current implementation: byte-wise writes (4 SPI_Master instances: READ/WRITE/STAT/CMD) with three reliability layers added on top of the v094 baseline:
+
+- **v095 — Per-byte write verify:** after every WIP=0, the just-written byte is read back via the READ master and compared to a snapshot taken at write time (`verify_byte`). Up to 2 retries per byte; persistent mismatch latches `error_latched` which drives the new `EEprom_error` output as a 1 Hz blink. Cleared at the start of each save.
+- **v096 — 256-byte shadow cache:** an in-RAM mirror of the EEPROM content, populated during the boot read and updated only after a successful (re-)verify. Each save trigger first scans 0x00..0xFF, comparing `shadow(addr)` vs `q_ram(addr)`, and only writes the bytes that actually differ. Idle saves emit zero SPI traffic.
+- **v097 — Delayed re-verify:** after the first verify passes, the FSM waits ~100 ms in `delay_reverify` and then re-reads the same byte. Only a second matching read commits the shadow update. The 100 ms idle window also functions as a recovery gap between consecutive WRITEs — empirically required for marginal M95512 chips whose internal charge pump or VCC-droop margin causes back-to-back writes to fail post-power-cycle even though WIP=0 fires correctly.
+
+`SPI_Master.vhd` is the pre-Stage-A version (no synchronous reset block) — modifying it has caused regressions in the past. **Do not change SPI_Master.vhd unless explicitly requested.**
+
+CMOS RAM region mirrored: 256 bytes, with `selection` (game-select-derived) as the high address byte. The R5101 dual-port RAM port B output is asynchronous with registered address — any state transition that drives a fresh `address_eeprom` toward `q_ram` must allow ≥1 settle cycle (the `Scan_Settle` state uses 5 cycles for margin).
