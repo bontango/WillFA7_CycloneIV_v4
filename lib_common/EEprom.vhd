@@ -63,6 +63,20 @@ end EEprom;
 architecture Behavioral of EEprom is
 
     -- ------------------------------------------------------------------
+    -- 256x8 single-port BRAM (M9K) for shadow cache
+    -- 2-cycle read latency: registered address + registered q
+    -- ------------------------------------------------------------------
+    component shadow_ram
+        port (
+            address : in  std_logic_vector(7 downto 0);
+            clock   : in  std_logic := '1';
+            data    : in  std_logic_vector(7 downto 0);
+            wren    : in  std_logic;
+            q       : out std_logic_vector(7 downto 0)
+        );
+    end component;
+
+    -- ------------------------------------------------------------------
     -- M95xxx SPI opcodes
     -- ------------------------------------------------------------------
     constant CMD_READ  : std_logic_vector(7 downto 0) := x"03";
@@ -156,9 +170,11 @@ architecture Behavioral of EEprom is
     signal blink_div     : integer range 0 to 25_000_000;
     signal blink_q       : std_logic;
 
-    -- 256-byte shadow cache
-    type shadow_t is array (0 to 255) of std_logic_vector(7 downto 0);
-    signal shadow        : shadow_t;
+    -- 256-byte shadow cache (external single-port BRAM)
+    -- Address driven directly from address_eeprom; 2-cycle read latency.
+    signal sh_data       : std_logic_vector(7 downto 0);
+    signal sh_wren       : std_logic;
+    signal sh_q          : std_logic_vector(7 downto 0);
 
     signal wr_ram_i      : std_logic;
 
@@ -251,6 +267,18 @@ begin
             TX_Start => TX_Start_Cmd, TX_Done => TX_Done_Cmd,
             clk => i_Clk,
             do_not_disable_SS => '0', do_not_enable_SS => '0'
+        );
+
+    -- ------------------------------------------------------------------
+    -- Shadow cache RAM (M9K block, 256x8, single-port)
+    -- ------------------------------------------------------------------
+    SHADOW_INST : shadow_ram
+        port map (
+            address => address_eeprom,
+            clock   => i_Clk,
+            data    => sh_data,
+            wren    => sh_wren,
+            q       => sh_q
         );
 
     -- ------------------------------------------------------------------
@@ -365,6 +393,8 @@ begin
             old_w_trigger   <= (others => '0');
             spi_op          <= OP_NONE;
             spi_start       <= '0';
+            sh_wren         <= '0';
+            sh_data         <= (others => '0');
             TX_Data_R       <= (others => '0');
             TX_Data_W       <= (others => '0');
             TX_Data_Stat    <= (others => '0');
@@ -379,8 +409,9 @@ begin
                 blink_div <= blink_div + 1;
             end if;
 
-            -- default: spi_start is a one-cycle pulse
+            -- default: spi_start and sh_wren are one-cycle pulses
             spi_start <= '0';
+            sh_wren   <= '0';
 
             case phase is
 
@@ -404,7 +435,8 @@ begin
                     if spi_done_p = '1' then
                         data_eeprom <= RX_Data_R(7 downto 0);
                         wr_ram_i    <= '1';
-                        shadow(to_integer(unsigned(address_eeprom))) <= RX_Data_R(7 downto 0);
+                        sh_data     <= RX_Data_R(7 downto 0);
+                        sh_wren     <= '1';
                         c_count     <= 0;
                     elsif wr_ram_i = '1' then
                         if c_count < HOLD_CYCLES then
@@ -482,7 +514,7 @@ begin
                     end if;
 
                 when PH_SCAN_COMPARE =>
-                    if shadow(to_integer(unsigned(address_eeprom))) /= q_ram then
+                    if sh_q /= q_ram then
                         byte_retry    <= 0;
                         reverify_pass <= '0';
                         phase         <= PH_WRITE_WREN;
@@ -543,7 +575,8 @@ begin
                                 phase         <= PH_REVERIFY_DELAY;
                             else
                                 -- second verify ok → commit shadow
-                                shadow(to_integer(unsigned(address_eeprom))) <= verify_byte;
+                                sh_data       <= verify_byte;
+                                sh_wren       <= '1';
                                 reverify_pass <= '0';
                                 byte_retry    <= 0;
                                 phase         <= PH_NEXT_BYTE;

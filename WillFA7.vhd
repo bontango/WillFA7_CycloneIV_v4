@@ -23,7 +23,7 @@
 -- v3.14 solenoid 17 with peak filter as we have 9uS peaks each 2mS on sp_solenoid_mpu(1);
 -- v3.15 Quartus 22.1, claude debug session: timing corrected, mem_clk confirmed, BT28 (SYS3 settings) corrected
 -- v3.16 intermidiate with possible 'CONTACT' patch for special solenoid
--- v3.17 eeprom write robustnes
+-- v3.17 eeprom write robustnes (new SD_card and eeprom.vhd, SPI Master consolidated )
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -194,6 +194,7 @@ signal sp_solenoid	:	std_logic_vector(7 downto 0); --6 special solenoids
 																		--plus two solenoids for flippers
 signal SPC_Sol_Trig_stable	:	std_logic_vector(6 downto 1); --stable switches spec sol trigger
 signal sp_solenoid_trig	:	std_logic_vector(6 downto 1); --6 special solenoids from trigger 
+signal sp_solenoid_trig_6		:	std_logic; --option for game CONTACT
 signal sp_solenoid_mpu	:	std_logic_vector(6 downto 1); --6 special solenoids from MPU (selftest)
 
 -- diff
@@ -1086,13 +1087,17 @@ port map(
 	o_Q => SPC_Sol_Trig_stable(6),
    i_Fast_Clk => clk_50
 	); 	
+-- For Game CONTACT no protection on spec. sol 6 as permanent
+-- special solenoïd is SOL22 (moving target relay) pin 9 on 2P12	
+-- active with option dip 6 to ON
+sp_solenoid_trig(6) <= SPC_Sol_Trig_stable(6) when game_option(6) = '0' else sp_solenoid_trig_6;
 SPECIAL6: entity work.spec_sol_trigger
 port map(
    clk_in => cpu_clk,
 	i_Rst_L => reset_l,
    trigger => SPC_Sol_Trig_stable(6),
 	pulse_cfg => game_option(3 downto 2),
-	solenoid => sp_solenoid_trig(6)
+	solenoid => sp_solenoid_trig_6
 	); 
 	
 ----------------
